@@ -257,30 +257,41 @@ Incidents are synthetically scattered within 50–300m of route points for demon
 ## Environment Variables
 
 ```env
-GROQ_API_KEY=your_groq_api_key_here
+GROQ_API_KEY=your_groq_api_key_here   # optional — AI features only
 # GOOGLE_MAPS_API_KEY is no longer required (legacy, kept for the deprecated
 # /get-maps-config endpoint only)
-PORT=5000
-FLASK_ENV=development
-BACKEND_URL=http://localhost:5000
-FRONTEND_URL=http://localhost:8000
+PORT=5000                             # backend port (Render sets this automatically)
 ```
 
 ---
 
 ## Running Locally
 
-```bash
-# Backend
-cd backend
-pip install -r requirements.txt
-python app.py
+No maps API keys needed — routing, geocoding and POI search use free OpenStreetMap services.
 
-# Frontend — serve with any static server
-cd frontend
-python -m http.server 8000
-# Open http://localhost:8000
+```bash
+# 1) Install dependencies (from the repo root — requirements.txt lives there)
+python -m venv venv
+source venv/bin/activate             # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+# 2) Backend — Flask + Socket.IO API on port 5000
+python backend/app.py
+
+# 3) Frontend — in a SECOND terminal, serve the static files on port 8000
+python -m http.server 8000 --directory frontend
 ```
+
+Then open:
+- Landing page → http://localhost:8000
+- Main app → http://localhost:8000/app.html
+- Admin dashboard → http://localhost:8000/admin.html
+
+> Open the app via `http://localhost:8000` — not by double-clicking the HTML
+> files. `frontend/config.js` auto-detects the environment: `localhost` /
+> `127.0.0.1` hostnames use the local backend (`http://localhost:5000`), any
+> other hostname uses the deployed backend
+> (`https://saferoute-backend-4b81.onrender.com`).
 
 ---
 

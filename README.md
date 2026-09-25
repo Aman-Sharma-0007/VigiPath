@@ -94,34 +94,52 @@ git clone https://github.com/yourusername/saferoute.git
 cd saferoute
 ```
 
-### 2. Environment Setup
+### 2. Environment Setup (optional)
+No API keys are required for maps — routing, geocoding and POI search run on free
+OpenStreetMap services. To enable the optional AI features, create a `.env` file
+in the project root:
 ```bash
-# Copy environment template
-cp .env.example .env
-
-# Edit .env with your API keys
-GROQ_API_KEY=your_groq_api_key_here
-# GOOGLE_MAPS_API_KEY is no longer required (legacy, kept for the deprecated
-# /get-maps-config endpoint only)
+# Create .env (optional — only needed for Groq AI features)
+echo "GROQ_API_KEY=your_groq_api_key_here" > .env
 ```
 
 ### 3. Install Dependencies
 ```bash
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 4. Run Application
-```bash
-# Start backend server
-python backend/app.py
+### 4. Run Application (two terminals)
 
-# Open frontend (in another terminal)
-# Serve frontend files on localhost:8000 or open index.html (landing) or app.html (main app) directly
+**Terminal 1 — backend API** (Flask + Socket.IO on port 5000):
+```bash
+python backend/app.py
+```
+
+**Terminal 2 — frontend** (static files on port 8000):
+```bash
+# From the project root:
+python -m http.server 8000 --directory frontend
 ```
 
 ### 5. Access Application
-- **Main App**: `http://localhost:5000` or open `frontend/app.html`
-- **Admin Dashboard**: `frontend/admin.html`
+- **Landing page**: http://localhost:8000
+- **Main App**: http://localhost:8000/app.html
+- **Admin Dashboard**: http://localhost:8000/admin.html
+- **Backend health check**: http://localhost:5000/health
+
+> ⚠️ **Important:** open the app via `http://localhost:8000` (or
+> `http://127.0.0.1:8000`) — **not** by double-clicking `app.html`
+> (`file://`). `frontend/config.js` auto-detects the environment: on a
+> `localhost`/`127.0.0.1` hostname it points at your local backend
+> (`http://localhost:5000`); on any other hostname (including `file://` and the
+> deployed site) it points at the production backend
+> (`https://saferoute-backend-4b81.onrender.com`). The backend allows all CORS
+> origins, so no extra CORS setup is needed locally.
+
+> ℹ️ The SQLite database (`saferoute.db`) is created automatically on first run,
+> next to the directory you launch the backend from.
 
 ## 🔧 API Endpoints
 
