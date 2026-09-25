@@ -25,7 +25,7 @@ SafeRoute is an intelligent navigation system that prioritizes user safety by an
 - **Multi-AI Provider Support**: Groq AI (llama-3.3-70b-versatile) for comprehensive analysis
 - **Smart Route Scoring**: AI evaluates routes based on crime incidents, lighting, and emergency services
 - **Real-time Risk Assessment**: Dynamic safety scores using multiple data sources
-- **Emergency Service Integration**: Google Places API integration for real hospital/police/petrol/hotel locations
+- **Emergency Service Integration**: OpenStreetMap (Overpass API) integration for real hospital/police/petrol/hotel locations
 - **Evenly Distributed POI Markers**: Hospitals, police stations, petrol pumps, and hotels are spatially distributed along each route using position-band sampling — not clustered at start/end
 
 ### 🧠 AI Route Intelligence (New)
@@ -83,10 +83,10 @@ SafeRoute/
 
 ### Prerequisites
 - Python 3.8+
-- Google Maps API Key
+- No maps API key required — mapping, routing, geocoding and POI search run on free
+  OpenStreetMap services (Leaflet, OSRM, Nominatim, Overpass API)
 - AI API Keys (optional, for enhanced AI features):
   - Groq AI API Key
-  - Google Gemini API Key
 
 ### 1. Clone Repository
 ```bash
@@ -101,8 +101,8 @@ cp .env.example .env
 
 # Edit .env with your API keys
 GROQ_API_KEY=your_groq_api_key_here
-GEMINI_API_KEY=your_gemini_api_key_here
-GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
+# GOOGLE_MAPS_API_KEY is no longer required (legacy, kept for the deprecated
+# /get-maps-config endpoint only)
 ```
 
 ### 3. Install Dependencies
@@ -209,7 +209,7 @@ Content-Type: application/json
 
 ### Fallback System
 1. **Primary**: Groq AI (`llama-3.3-70b-versatile`)
-2. **Secondary**: Google Places API (real location data for POI markers)
+2. **Secondary**: OpenStreetMap Overpass API (real location data for POI markers)
 3. **Tertiary**: Client-side calculation (safety scores, narration text, forecast bars)
 4. **Final**: Generic emergency suggestions with helpline numbers
 
@@ -263,7 +263,7 @@ Weekend penalty: −3 points. Groq AI adds a one-sentence contextual insight per
 # Set environment variables
 export PORT=5000
 export GROQ_API_KEY=your_key
-export GOOGLE_MAPS_API_KEY=your_key
+# No maps API key needed — OpenStreetMap services are free and keyless
 
 # Run production server
 python backend/app.py
@@ -276,12 +276,13 @@ python backend/app.py
 - **Flask-SocketIO**: Real-time WebSocket communication
 - **SQLite**: Lightweight database for alerts and feedback
 - **Groq AI SDK**: `llama-3.3-70b-versatile` for route explanation, narration, and prediction
-- **Google Directions API**: Multi-route planning with polyline encoding
-- **Google Places API (New)**: Real hospital, police, petrol pump, and hotel locations along routes
+- **OSRM (Open Source Routing Machine)**: Multi-route planning with polyline encoding — free & keyless
+- **Overpass API (OpenStreetMap)**: Real hospital, police, petrol pump, and hotel locations along routes
+- **Nominatim (OpenStreetMap)**: Geocoding for the backend route-planning fallback
 
 ### Frontend
 - **Vanilla JavaScript**: No framework dependencies
-- **Google Maps JavaScript API**: Interactive mapping with HeatmapLayer, DirectionsRenderer, custom SVG markers
+- **Leaflet + OpenStreetMap tiles**: Interactive mapping with leaflet.heat heatmap layer, safety-colored route polylines, custom SVG markers — no API key
 - **Web Speech Synthesis API**: Browser-native TTS for route narration
 - **Socket.IO Client**: Real-time SOS and community report updates
 - **Modern CSS**: Responsive design with dark mode, animated route cards, forecast bars
@@ -392,7 +393,7 @@ This project is open source and available under the [MIT License](LICENSE).
 
 - **Groq AI** for providing fast, unlimited AI inference
 - **Google Gemini** for advanced AI reasoning capabilities
-- **Google Maps Platform** for comprehensive location services
+- **OpenStreetMap** (and its OSRM / Nominatim / Overpass services) for comprehensive, free location data
 - **Open Source Community** for inspiration and tools
 - **Hackathon Organizers** for the opportunity to build for social impact
 
