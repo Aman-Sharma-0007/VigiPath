@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SafeRoute - Intelligent Safety Navigation</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        /* --- 1. PREMIUM VARIABLES & RESET --- */
+        :root {
+            --primary: #10b981;       /* Emerald 500 */
+            --primary-glow: #34d399;  /* Emerald 400 */
+            --dark-bg: #064e3b;       /* Emerald 900 */
+            --text-white: #ffffff;
+            --text-off-white: #f1f5f9;
+            --text-dark: #0f172a;
+            
+            /* Gradients */
+            --grad-hero: linear-gradient(135deg, #022c22 0%, #065f46 50%, #10b981 100%);
+            --grad-card: linear-gradient(145deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05));
+            
+            /* Glassmorphism */
+            --glass-border: 1px solid rgba(255, 255, 255, 0.15);
+            --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+            --backdrop: blur(12px);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--dark-bg);
+            color: var(--text-white);
+            overflow-x: hidden;
+            line-height: 1.6;
+        }
+
+        /* --- 2. GLOBAL ANIMATIONS --- */
+        @keyframes fadeUpStagger {
+            from { opacity: 0; transform: translateY(40px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-20px); }
+        }
+
+        @keyframes pulse-glow {
+            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+            70% { box-shadow: 0 0 0 15px rgba(16, 185, 129, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+
+        @keyframes orb-move {
+            0% { transform: translate(0, 0); }
+            33% { transform: translate(30px, -50px); }
+            66% { transform: translate(-20px, 20px); }
+            100% { transform: translate(0, 0); }
+        }
+
+        /* --- 3. NAVBAR --- */
+        nav {
+            position: fixed; top: 0; width: 100%; padding: 20px 8%;
+            display: flex; justify-content: space-between; align-items: center;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.2); /* Darker glass for contrast */
+            backdrop-filter: var(--backdrop);
+            border-bottom: var(--glass-border);
+            transition: 0.3s;
+        }
+
+        .logo {
+            font-size: 1.6rem; font-weight: 800; color: var(--text-white);
+            display: flex; align-items: center; gap: 12px; letter-spacing: -0.5px;
+        }
+        .logo i { color: var(--primary-glow); font-size: 1.5rem; filter: drop-shadow(0 0 8px rgba(52, 211, 153, 0.5)); }
+
+        .nav-btn {
+            background: rgba(3, 97, 64, 0.4); color: rgb(255, 255, 255);
+            padding: 10px 24px; border-radius: 50px;
+            font-weight: 600; text-decoration: none;
+            border: 1px solid rgba(255,255,255,1);
+            transition: all 0.3s ease;
+        }
+        .nav-btn:hover { background: var(--text-white); color: var(--primary); transform: scale(1.05); }
+
+        /* --- 4. HERO SECTION (Premium Gradient) --- */
+        .hero {
+            position: relative;
+            min-height: 100vh;
+            display: grid; grid-template-columns: 1.1fr 0.9fr;
+            align-items: center; gap: 60px;
+            padding: 120px 8% 80px;
+            background: var(--grad-hero);
+            overflow: hidden;
+        }
+
+        /* Canvas behind hero */
+        #hero-canvas {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 0; opacity: 0.4; pointer-events: none;
+        }
+
+        .hero-content { z-index: 2; position: relative; }
+
+        .hero h1 {
+            font-size: 4.5rem; line-height: 1.1; margin-bottom: 24px;
+            font-weight: 800; letter-spacing: -2px;
+            text-shadow: 0 4px 20px rgba(0,0,0,0.2);
+        }
+
+        .hero p {
+            font-size: 1.25rem; color: rgba(255,255,255,0.85); margin-bottom: 40px;
+            max-width: 600px; line-height: 1.7; font-weight: 400;
+        }
+
+        .cta-btn {
+            display: inline-flex; align-items: center; gap: 12px;
+            background: var(--primary); color: white;
+            padding: 18px 40px; border-radius: 16px;
+            font-size: 1.1rem; font-weight: 700; text-decoration: none;
+            transition: 0.3s;
+            border: 1px solid rgba(255,255,255,0.2);
+            animation: pulse-glow 3s infinite;
+        }
+        .cta-btn:hover { transform: translateY(-4px); background: #059669; }
+
+        .stats-row {
+            margin-top: 60px; display: flex; gap: 40px;
+            padding-top: 30px; border-top: 1px solid rgba(255,255,255,0.15);
+        }
+        .stat-item h3 { font-size: 2.2rem; margin: 0; line-height: 1; font-weight: 800; }
+        .stat-item p { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1.5px; opacity: 0.7; margin-top: 5px; }
+
+
+        /* --- 5. HERO MOCKUP (The White Card) --- */
+        .hero-visual {
+            z-index: 2; display: flex; justify-content: center;
+            animation: float 6s ease-in-out infinite;
+        }
+
+        .mockup-card {
+            background: rgba(255, 255, 255, 0.95); /* Solid White-ish */
+            padding: 35px; border-radius: 30px;
+            width: 100%; max-width: 440px;
+            box-shadow: 0 30px 60px rgba(0,0,0,0.3);
+            color: var(--text-dark); /* Dark text on white card */
+        }
+        
+        .mock-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .badge { background: #d1fae5; color: #047857; padding: 6px 12px; border-radius: 8px; font-weight: 700; font-size: 0.8rem; }
+        
+        .mock-score { font-size: 6rem; font-weight: 900; color: var(--primary); line-height: 1; letter-spacing: -3px; margin-bottom: 5px; }
+        .mock-sub { color: #64748b; font-size: 0.95rem; margin-bottom: 30px; }
+        
+        .mock-stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 30px; }
+        .ms-item { background: #f8fafc; padding: 15px; border-radius: 15px; text-align: center; border: 1px solid #e2e8f0; }
+        .ms-item i { font-size: 1.4rem; color: var(--primary); margin-bottom: 8px; display: block; }
+        .ms-item b { display: block; font-size: 1.2rem; }
+        .ms-item span { font-size: 0.7rem; color: #64748b; text-transform: uppercase; font-weight: 600; }
+        
+        .mock-btn-nav { width: 100%; background: var(--primary); color: white; border: none; padding: 16px; border-radius: 12px; font-weight: 700; font-size: 1rem; cursor: pointer; box-shadow: 0 10px 20px rgba(16, 185, 129, 0.2); }
+
+
+        /* --- 6. FEATURES SECTION (Cascading Animation) --- */
+        .features {
+            position: relative;
+            padding: 120px 8%;
+            background: #022c22; /* Darker green base */
+            overflow: hidden;
+        }
+
+        /* Ambient Orbs Background */
+        .orb {
+            position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.4; z-index: 0;
+            animation: orb-move 10s infinite alternate;
+        }
+        .orb-1 { width: 300px; height: 300px; background: #10b981; top: 10%; left: -5%; }
+        .orb-2 { width: 400px; height: 400px; background: #3b82f6; bottom: 10%; right: -10%; animation-delay: -5s; }
+
+        .sec-head { text-align: center; margin-bottom: 80px; position: relative; z-index: 2; }
+        .sec-head h2 { font-size: 3rem; margin-bottom: 15px; background: linear-gradient(to right, #fff, #a7f3d0); background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .sec-head p { color: rgba(255,255,255,0.7); max-width: 600px; margin: 0 auto; font-size: 1.2rem; }
+
+        .grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 40px; position: relative; z-index: 2;
+        }
+
+        /* Premium Glass Cards */
+        .card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 40px 30px; border-radius: 24px;
+            backdrop-filter: blur(10px);
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            
+            /* Initial State for Animation */
+            opacity: 0;
+            transform: translateY(30px);
+        }
+
+        /* Hover Effect */
+        .card:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: var(--primary);
+            transform: translateY(-10px) scale(1.02);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+        }
+
+        /* Staggered Animation Triggered by JS */
+        .grid.active .card { animation: fadeUpStagger 0.8s forwards; }
+        .grid.active .card:nth-child(1) { animation-delay: 0.1s; }
+        .grid.active .card:nth-child(2) { animation-delay: 0.2s; }
+        .grid.active .card:nth-child(3) { animation-delay: 0.3s; }
+        .grid.active .card:nth-child(4) { animation-delay: 0.4s; }
+        .grid.active .card:nth-child(5) { animation-delay: 0.5s; }
+        .grid.active .card:nth-child(6) { animation-delay: 0.6s; }
+
+        .icon-box {
+            width: 60px; height: 60px; background: rgba(255,255,255,0.1); border-radius: 16px;
+            display: flex; align-items: center; justify-content: center; margin-bottom: 25px;
+            font-size: 1.5rem; color: var(--primary-glow); border: 1px solid rgba(255,255,255,0.05);
+        }
+
+        .card h3 { font-size: 1.4rem; margin-bottom: 12px; color: white; }
+        .card p { color: rgba(255,255,255,0.7); font-size: 1rem; line-height: 1.6; }
+
+
+        /* --- 7. HOW IT WORKS (Modern & Clean) --- */
+        .steps {
+            padding: 120px 8%;
+            background: #ffffff; /* Contrast break - Clean White */
+            color: var(--text-dark);
+            position: relative;
+        }
+
+        .steps-head h2 { font-size: 3rem; color: var(--text-dark); margin-bottom: 60px; text-align: center; font-weight: 800; }
+
+        .steps-container { display: flex; justify-content: center; gap: 50px; flex-wrap: wrap; }
+        
+        .step-item { 
+            flex: 1; min-width: 280px; text-align: center; position: relative; 
+            opacity: 0; transform: translateY(30px); transition: 0.6s ease;
+        }
+        .steps.active .step-item { opacity: 1; transform: translateY(0); }
+        .steps.active .step-item:nth-child(1) { transition-delay: 0.1s; }
+        .steps.active .step-item:nth-child(2) { transition-delay: 0.3s; }
+        .steps.active .step-item:nth-child(3) { transition-delay: 0.5s; }
+
+        .step-circle {
+            width: 80px; height: 80px;
+            background: var(--text-dark); color: white;
+            font-size: 2rem; font-weight: 700; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 30px; position: relative; z-index: 2;
+            box-shadow: 0 15px 30px rgba(0,0,0,0.15);
+        }
+        
+        .step-item::after {
+            content: ''; position: absolute; top: 40px; left: 50%; width: 100%; height: 2px;
+            background: #e2e8f0; z-index: 1;
+        }
+        .step-item:last-child::after { display: none; }
+
+        .step-item h4 { font-size: 1.5rem; margin-bottom: 15px; font-weight: 700; }
+        .step-item p { color: var(--text-muted); font-size: 1.1rem; }
+
+
+        /* --- 8. FOOTER --- */
+        footer {
+            background: #0f172a; color: #94a3b8;
+            padding: 80px 8% 40px; text-align: center; border-top: 1px solid #1e293b;
+        }
+        .f-logo { font-size: 2rem; color: white; margin-bottom: 0px; display: inline-block; font-weight: 800; }
+        .copyright { border-top: 1px solid #1e293b; padding-top: 30px; margin-top: 20px; font-size: 0.9rem; }
+
+        /* Responsive */
+        @media (max-width: 968px) {
+            .hero { grid-template-columns: 1fr; text-align: center; padding-top: 140px; }
+            .hero h1 { font-size: 3rem; }
+            .stats-row { justify-content: center; }
+            .step-item::after { display: none; }
+            .hero-visual { display: none; } /* Hide mockup on small mobile for space */
+        }
+        @media (min-width: 969px) {
+             .hero-visual { display: flex; }
+        }
+    </style>
+</head>
+<body>
+
+    <nav>
+        <div class="logo">
+            SafeRoute
+        </div>
+        <a href="app.html" class="nav-btn">Launch App</a>
+    </nav>
+
+    <section class="hero">
+        <canvas id="hero-canvas"></canvas>
+        
+        <div class="hero-content">
+            <h1>Don't Just Navigate. <br> Travel Safer.</h1>
+            <p>We transform standard maps into a safety-first guidance system by analyzing lighting, police density, and incident history in real-time.</p>
+            
+            <a href="app.html" class="cta-btn">
+                Start Analysis <i class="fa-solid fa-arrow-right"></i>
+            </a>
+
+            <div class="stats-row">
+                <div class="stat-item">
+                    <h3>Live</h3>
+                    <p>Infrastructure</p>
+                </div>
+                <div class="stat-item">
+                    <h3>250m</h3>
+                    <p>Precision Scan</p>
+                </div>
+                <div class="stat-item">
+                    <h3>AI</h3>
+                    <p>Emergency Aid</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="hero-visual">
+            <div class="mockup-card">
+                <div class="mock-head">
+                    <span style="font-weight: 700; font-size: 1.1rem;">Route Analysis</span>
+                    <span class="badge">SAFEST CHOICE</span>
+                </div>
+                
+                <div class="mock-score">94</div>
+                <div class="mock-sub">Safety Score Verified</div>
+
+                <div class="mock-stats">
+                    <div class="ms-item">
+                        <i class="fa-solid fa-user-shield"></i>
+                        <b>3</b>
+                        <span>Police</span>
+                    </div>
+                    <div class="ms-item">
+                        <i class="fa-solid fa-hospital"></i>
+                        <b>2</b>
+                        <span>Hospitals</span>
+                    </div>
+                    <div class="ms-item">
+                        <i class="fa-solid fa-lightbulb"></i>
+                        <b>High</b>
+                        <span>Visibility</span>
+                    </div>
+                </div>
+
+                <button class="mock-btn-nav" onclick="window.location.href='app.html'">Start Navigation</button>
+            </div>
+        </div>
+    </section>
+
+    <section class="features reveal-trigger">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+
+        <div class="sec-head">
+            <h2>Comprehensive Safety Suite</h2>
+            <p>Advanced algorithms working invisibly to keep you safe.</p>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <div class="icon-box"><i class="fa-solid fa-route"></i></div>
+                <h3>Route Analysis</h3>
+                <p>Advanced algorithms analyze crime data and lighting to recommend the safest routes.</p>
+            </div>
+            <div class="card">
+                <div class="icon-box"><i class="fa-solid fa-tower-broadcast"></i></div>
+                <h3>Emergency SOS</h3>
+                <p>One-tap SOS broadcasting your exact location to emergency contacts.</p>
+            </div>
+            <div class="card">
+                <div class="icon-box"><i class="fa-solid fa-users-viewfinder"></i></div>
+                <h3>Community Reports</h3>
+                <p>Real-time crowd-sourced safety alerts from local users.</p>
+            </div>
+            <div class="card">
+                <div class="icon-box"><i class="fa-solid fa-hospital"></i></div>
+                <h3>Emergency Services</h3>
+                <p>Instant access to nearby hospitals and police stations with direct navigation.</p>
+            </div>
+            <div class="card">
+                <div class="icon-box"><i class="fa-solid fa-chart-line"></i></div>
+                <h3>Crime Analytics</h3>
+                <p>Visual crime heatmaps showing incident types and severity levels.</p>
+            </div>
+            <div class="card">
+                <div class="icon-box"><i class="fa-regular fa-lightbulb"></i></div>
+                <h3>Smart Lighting</h3>
+                <p>Calculated street lighting density scores for safer night travel.</p>
+            </div>
+        </div>
+    </section>
+
+    <section class="steps reveal-trigger">
+        <div class="steps-head">
+            <h2>How SafeRoute Works</h2>
+        </div>
+        <div class="steps-container">
+            <div class="step-item">
+                <div class="step-circle">1</div>
+                <h4>Enter Destination</h4>
+                <p>Simply input your starting point and destination. Our system analyzes multiple options.</p>
+            </div>
+            <div class="step-item">
+                <div class="step-circle">2</div>
+                <h4>Safety Analysis</h4>
+                <p>We process crime data, lighting, and amenities in real-time.</p>
+            </div>
+            <div class="step-item">
+                <div class="step-circle">3</div>
+                <h4>Choose Route</h4>
+                <p>Select the route with the highest Safety Score and navigate with confidence.</p>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="f-logo">SafeRoute AI</div>
+        <div class="copyright">
+            &copy; 2025 SafeRoute AI. Built by <strong>Team Thrivers</strong> for <strong>GDGoC x MREM - TechSprint</strong>.
+        </div>
+    </footer>
+
+    <script>
+        // 1. HERO CANVAS ANIMATION (Network Particles)
+        const canvas = document.getElementById('hero-canvas');
+        const ctx = canvas.getContext('2d');
+        let w, h, particles = [];
+
+        function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+        window.addEventListener('resize', resize);
+        resize();
+
+        class Particle {
+            constructor() {
+                this.x = Math.random() * w; this.y = Math.random() * h;
+                this.vx = (Math.random() - 0.5) * 0.3; this.vy = (Math.random() - 0.5) * 0.3;
+                this.size = Math.random() * 2;
+            }
+            update() {
+                this.x += this.vx; this.y += this.vy;
+                if(this.x < 0 || this.x > w) this.vx *= -1;
+                if(this.y < 0 || this.y > h) this.vy *= -1;
+            }
+            draw() {
+                ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI*2); ctx.fill();
+            }
+        }
+
+        function init() { particles = []; for(let i=0; i<60; i++) particles.push(new Particle()); }
+        init();
+
+        function animate() {
+            ctx.clearRect(0,0,w,h);
+            for(let i=0; i<particles.length; i++) {
+                let p = particles[i]; p.update(); p.draw();
+                for(let j=i+1; j<particles.length; j++) {
+                    let p2 = particles[j];
+                    let dist = Math.hypot(p.x-p2.x, p.y-p2.y);
+                    if(dist < 120) {
+                        ctx.strokeStyle = `rgba(255,255,255,${0.1 - dist/1200})`;
+                        ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+                    }
+                }
+            }
+            requestAnimationFrame(animate);
+        }
+        animate();
+
+        // 2. SCROLL REVEAL ANIMATION (Intersection Observer)
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if(entry.isIntersecting) {
+                    // Add 'active' class to trigger CSS animations
+                    entry.target.classList.add('active');
+                }
+            });
+        }, { threshold: 0.15 });
+
+        // Target sections to trigger their children's animations
+        document.querySelectorAll('.reveal-trigger, .steps, .grid').forEach(el => observer.observe(el));
+    </script>
+</body>
+</html>
