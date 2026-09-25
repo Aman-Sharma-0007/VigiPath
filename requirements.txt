@@ -22,7 +22,7 @@ eventlet>=0.36.1
 # HTTP Requests for APIs
 requests==2.31.0
 
-# Google Maps Route Encoding/Decoding
+# Route Encoding/Decoding (Google/OSRM-compatible polyline format)
 polyline==2.0.0
 
 # Groq AI Integration

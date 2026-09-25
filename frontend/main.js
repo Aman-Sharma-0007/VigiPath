@@ -1,5 +1,5 @@
 /* --- Global Variables --- */
-let map, directionsService;
+let map; // Leaflet map instance (OpenStreetMap tiles)
 let rendererArray = [], currentRoutes = [], lastDirectionsResult = null;
 let userMarker = null, crimeMarkers = [], feedbackMarkers = [];
 let hospitalMarkers = [], policeMarkers = []; // Markers for hospitals and police stations
@@ -7,60 +7,131 @@ let allFeedbacks = [];
 let heatmapLayer = null, heatmapActive = false;
 const socket = io(window.BACKEND_URL);
 
-/* --- Secure Google Maps API Loader --- */
-async function loadGoogleMapsAPI() {
-    try {
-        console.log('🔐 Loading Google Maps API securely...');
-        console.log('🌐 Backend URL:', window.BACKEND_URL);
-        
-        // Get API key from backend securely
-        const response = await fetch(`${window.BACKEND_URL}/get-maps-config`);
-        
-        if (!response.ok) {
-            throw new Error(`Backend responded with status ${response.status}`);
-        }
-        
-        const config = await response.json();
-        console.log('📦 Config received:', config ? 'OK' : 'Empty');
-        
-        if (!config || !config.google_maps_api_key) {
-            throw new Error('Google Maps API key not available from backend');
-        }
-        
-        console.log('🔑 API key received (length:', config.google_maps_api_key.length, ')');
-        
-        // Load Google Maps API dynamically
-        const script = document.createElement('script');
-        script.src = `https://maps.googleapis.com/maps/api/js?key=${config.google_maps_api_key}&libraries=places,visualization,geometry&callback=initMap`;
-        script.async = true;
-        script.defer = true;
-        
-        // Add error handling
-        script.onerror = () => {
-            console.error('❌ Failed to load Google Maps API script');
-            alert('Failed to load Google Maps. Please check:\n1. Internet connection\n2. Google Maps API key is valid\n3. Browser console for details');
-        };
-        
-        // Add timeout check
-        let timeoutId = setTimeout(() => {
-            if (!window.google || !window.google.maps) {
-                console.error('❌ Google Maps API load timeout');
-                alert('Google Maps API is taking too long to load. Please refresh the page.');
-            }
-        }, 10000); // 10 second timeout
-        
-        script.onload = () => {
-            clearTimeout(timeoutId);
-            console.log('✅ Google Maps API script loaded successfully');
-        };
-        
-        document.head.appendChild(script);
-        console.log('📝 Google Maps API script tag added to page');
-        
-    } catch (error) {
-        console.error('❌ Error loading Google Maps API:', error);
-        alert(`Failed to load Google Maps configuration:\n${error.message}\n\nPlease check:\n1. Backend server is running\n2. Backend URL is correct: ${window.BACKEND_URL}\n3. Browser console for details`);
-    }
+/* --- Free & keyless map services (replaced Google Maps Platform) --- */
+// OSRM demo server — driving routes with alternatives, CORS enabled, no API key
+const OSRM_BASE_URL = 'https://router.project-osrm.org';
+// Nominatim — OpenStreetMap geocoding / reverse geocoding, no API key
+const NOMINATIM_BASE_URL = 'https://nominatim.openstreetmap.org';
+
+// Session cache for geocoded locations (respects Nominatim's fair-use policy)
+const geocodeCache = new Map();
+
+/* --- Encoded polyline decoder (Google/OSRM-compatible, precision 5) --- */
+function decodePolyline(str, precision = 5) {
+  let index = 0, lat = 0, lng = 0;
+  const coordinates = [];
+  const factor = Math.pow(10, precision);
+
+  while (index < str.length) {
+    let byte, shift = 0, result = 0;
+    do {
+      byte = str.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+    lat += ((result & 1) ? ~(result >> 1) : (result >> 1));
+
+    shift = 0; result = 0;
+    do {
+      byte = str.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+    lng += ((result & 1) ? ~(result >> 1) : (result >> 1));
+
+    coordinates.push([lat / factor, lng / factor]);
+  }
+  return coordinates;
+}
+
+/* --- Geocoding helpers (Nominatim) --- */
+const COORDINATE_PATTERN = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/;
+
+// Resolves a free-text location (or "lat,lng" pair) to {lat, lng}
+async function geocodeLocation(query) {
+  const q = (query || '').trim();
+  if (!q) return null;
+
+  const coordMatch = q.match(COORDINATE_PATTERN);
+  if (coordMatch) {
+    const lat = parseFloat(coordMatch[1]), lng = parseFloat(coordMatch[2]);
+    if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng };
+  }
+
+  if (geocodeCache.has(q)) return geocodeCache.get(q);
+
+  const response = await fetch(`${NOMINATIM_BASE_URL}/search?q=${encodeURIComponent(q)}&format=json&limit=1`);
+  if (!response.ok) throw new Error(`Geocoding failed (HTTP ${response.status})`);
+  const results = await response.json();
+  const location = (Array.isArray(results) && results.length > 0)
+    ? { lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon), name: results[0].display_name }
+    : null;
+
+  geocodeCache.set(q, location);
+  return location;
+}
+
+// Resolves GPS coordinates to a human-readable address
+async function reverseGeocodeLocation(lat, lng) {
+  const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+  if (geocodeCache.has(key)) return geocodeCache.get(key);
+  try {
+    const response = await fetch(`${NOMINATIM_BASE_URL}/reverse?lat=${lat}&lon=${lng}&format=json&zoom=18&addressdetails=1`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    const address = data && data.display_name ? data.display_name : null;
+    geocodeCache.set(key, address);
+    return address;
+  } catch (err) {
+    console.warn('⚠️ Reverse geocoding failed:', err);
+    return null;
+  }
+}
+
+/* --- Distance / duration formatting (OSRM returns raw meters/seconds) --- */
+function formatDistanceMeters(meters) {
+  if (meters < 1000) return `${Math.round(meters)} m`;
+  return `${(meters / 1000).toFixed(1)} km`;
+}
+
+function formatDurationSeconds(seconds) {
+  const mins = Math.round(seconds / 60);
+  if (mins < 60) return `${mins} min`;
+  const hrs = Math.floor(mins / 60), rem = mins % 60;
+  return rem > 0 ? `${hrs} hr ${rem} mins` : `${hrs} hr`;
+}
+
+/* --- Route planning via OSRM (replaces google.maps.DirectionsService) --- */
+async function fetchRoutesFromOSRM(source, destination) {
+  // Nominatim fair-use: sequential requests, spaced ~1.1s apart
+  const origin = await geocodeLocation(source);
+  await new Promise(r => setTimeout(r, 1100));
+  const dest = await geocodeLocation(destination);
+
+  if (!origin) throw new Error(`Could not find "${source}" on the map. Try a different spelling or use lat,lng.`);
+  if (!dest) throw new Error(`Could not find "${destination}" on the map. Try a different spelling or use lat,lng.`);
+
+  const coords = `${origin.lng},${origin.lat};${dest.lng},${dest.lat}`;
+  const url = `${OSRM_BASE_URL}/route/v1/driving/${coords}?alternatives=3&overview=full&geometries=polyline`;
+
+  console.log(`🗺️ OSRM route request: ${source} → ${destination}`);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Routing service error (HTTP ${response.status})`);
+  const data = await response.json();
+
+  if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+    throw new Error(`No driving route found (${data.code || 'NoRoute'})`);
+  }
+
+  return data.routes.map((r, i) => ({
+    index: i,
+    polyline: r.geometry,                 // encoded polyline (precision 5, same as before)
+    distance_text: formatDistanceMeters(r.distance),
+    distance_meters: Math.round(r.distance),
+    duration_text: formatDurationSeconds(r.duration),
+    duration_seconds: Math.round(r.duration),
+    summary: (r.legs && r.legs[0] && r.legs[0].summary) || ''
+  }));
 }
 
 // Ping backend on load so Render free-tier wakes up before the user needs AI features
@@ -70,10 +141,10 @@ function warmUpBackend() {
     .catch(() => console.log('⏳ Backend waking up...'));
 }
 
-// Load Google Maps API when page loads
+// Initialize the Leaflet map when the page loads (no API key needed)
 document.addEventListener('DOMContentLoaded', () => {
   warmUpBackend();
-  loadGoogleMapsAPI();
+  initMap();
 });
 
 /* --- ✅ NEW: Safety-Based Color System --- */
@@ -128,18 +199,25 @@ window.initMap = function () {
       return;
     }
     
-    map = new google.maps.Map(mapElement, {
-      center: { lat: 17.385, lng: 78.4867 },
+    if (typeof L === 'undefined') {
+      console.error("❌ Leaflet library not loaded!");
+      alert("Failed to load the map library (Leaflet). Please check your internet connection and refresh the page.");
+      return;
+    }
+
+    // Leaflet map with free OpenStreetMap tiles (no API key required)
+    map = L.map(mapElement, {
+      center: [17.385, 78.4867],
       zoom: 12,
-      mapTypeControl: false,
-      fullscreenControl: false,
-      streetViewControl: false,
-      zoomControl: false,
-      styles: []
+      zoomControl: false
     });
+
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors'
+    }).addTo(map);
     
-    console.log("✅ Map initialized successfully");
-    directionsService = new google.maps.DirectionsService();
+    console.log("✅ Leaflet map initialized successfully (OpenStreetMap)");
     initializeSocketIO();
     fetchFeedbackForRoute();
   } catch (error) {
@@ -175,8 +253,7 @@ function initializeSocketIO() {
     updateFeedbackListUI();
     
     // Clear displayed routes
-    rendererArray.forEach((r) => r.setMap(null));
-    rendererArray = [];
+    clearRouteRenderers();
     currentRoutes = [];
     
     // Clear route cards
@@ -194,7 +271,7 @@ function initializeSocketIO() {
 }
 
 /* --- 2. Route Logic --- */
-window.findRoutes = function () {
+window.findRoutes = async function () {
   const source = document.getElementById("source").value;
   const destination = document.getElementById("destination").value;
 
@@ -202,35 +279,37 @@ window.findRoutes = function () {
 
   startLoadingAnimation();
 
-  directionsService.route({
-      origin: source,
-      destination: destination,
-      travelMode: google.maps.TravelMode.DRIVING,
-      provideRouteAlternatives: true
-    }, (result, status) => {
-      if (status === "OK") {
-        lastDirectionsResult = result;
-        sendToBackendForAnalysis(source, destination);
-      } else {
-        stopLoadingAnimation();
-        alert("Routes not found. Please try different locations.");
-      }
+  try {
+    // Get alternative driving routes from OSRM (free, keyless routing service)
+    const routes = await fetchRoutesFromOSRM(source, destination);
+
+    if (!routes || routes.length === 0) {
+      stopLoadingAnimation();
+      alert("Routes not found. Please try different locations.");
+      return;
     }
-  );
+
+    lastDirectionsResult = { routes };
+    sendToBackendForAnalysis(source, destination);
+  } catch (error) {
+    console.error("❌ Route search failed:", error);
+    stopLoadingAnimation();
+    alert(`Could not find routes: ${error.message}\n\nPlease check:\n1. Both locations are spelled correctly (or use lat,lng)\n2. Internet connection\n3. A road route exists between them`);
+  }
 };
 
 function sendToBackendForAnalysis(source, destination) {
   console.log(`🔍 Sending route request to backend: ${source} → ${destination}`);
 
-  // Pass the exact routes Google returned to the frontend so the backend
-  // analyses the same polylines — no separate Directions call, no index mismatch.
+  // Pass the exact routes OSRM returned to the frontend so the backend
+  // analyses the same polylines — no separate routing call, no index mismatch.
   const frontendRoutes = (lastDirectionsResult && lastDirectionsResult.routes || []).map((r, i) => ({
     index: i,
-    polyline: r.overview_polyline,        // JS API: already a string, not .points
-    distance_text: r.legs[0].distance.text,
-    distance_meters: r.legs[0].distance.value,
-    duration_text: r.legs[0].duration.text,
-    duration_seconds: r.legs[0].duration.value,
+    polyline: r.polyline,
+    distance_text: r.distance_text,
+    distance_meters: r.distance_meters,
+    duration_text: r.duration_text,
+    duration_seconds: r.duration_seconds,
     summary: r.summary || ''
   }));
 
@@ -647,151 +726,132 @@ window.narrateRoute = async function(event, index) {
   }
 };
 
-/* --- ✅ UPDATED: Route Rendering with Safety Colors --- */
-function renderAllRoutes(selectedIndex) {
-  rendererArray.forEach((r) => r.setMap(null));
+/* --- ✅ UPDATED: Route Rendering with Safety Colors (Leaflet) --- */
+function clearRouteRenderers() {
+  rendererArray.forEach((layer) => { if (map) map.removeLayer(layer); });
   rendererArray = [];
-  
+}
+
+function renderAllRoutes(selectedIndex) {
+  clearRouteRenderers();
+
   // Clear hospital and police markers when switching routes
   clearHospitalsAndPolice();
 
   if (!lastDirectionsResult) return;
 
-  // Handle both real Google routes and synthetic routes
+  // Handle both real OSRM routes and synthetic routes
   const totalRoutes = Math.max(lastDirectionsResult.routes.length, currentRoutes.length);
+  const combinedBounds = L.latLngBounds([]);
 
   for (let index = 0; index < totalRoutes; index++) {
     const isSelected = index === selectedIndex;
     const hasRouteData = index < currentRoutes.length;
-    // Use the original Google route index stored during backend sorting,
+    // Use the original route index stored during backend sorting,
     // so the correct polyline is drawn for each safety-ranked card.
     const originalRouteIndex = (hasRouteData && currentRoutes[index].index !== undefined)
       ? currentRoutes[index].index
       : index;
-    const hasGoogleRoute = originalRouteIndex < lastDirectionsResult.routes.length;
-    
+    const hasPlannedRoute = originalRouteIndex < lastDirectionsResult.routes.length;
+
     // ✅ Get safety-based color for ALL routes (not just selected)
     let routeColor = "#94a3b8"; // Default gray fallback
-    
+
     if (hasRouteData && currentRoutes[index]) {
       const safetyScore = currentRoutes[index].safety_score || 0;
       routeColor = getSafetyColor(safetyScore);
-      
+
       console.log(`🎨 Rendering Route ${index + 1}:`);
       console.log(`   Safety Score: ${safetyScore}`);
       console.log(`   Route Color: ${routeColor}`);
       console.log(`   Selected: ${isSelected ? 'YES' : 'NO'}`);
-      console.log(`   Has Google Route: ${hasGoogleRoute ? 'YES' : 'NO (Synthetic)'}`);
+      console.log(`   Has Planned Route: ${hasPlannedRoute ? 'YES' : 'NO (Synthetic)'}`);
       console.log(`   Status: ${safetyScore >= 75 ? 'SAFE ✅' : safetyScore >= 60 ? 'MODERATE ⚠️' : 'UNSAFE ❌'}`);
     } else {
       console.log(`⚠️ Route ${index + 1}: No safety data available, using gray`);
     }
 
-    if (hasGoogleRoute) {
-      // Use Google's DirectionsRenderer for real routes
-      const renderer = new google.maps.DirectionsRenderer({
-        map: map,
-        directions: lastDirectionsResult,
-        routeIndex: originalRouteIndex,
-        suppressMarkers: isSelected,
-        polylineOptions: {
-          strokeColor: routeColor,
-          strokeOpacity: isSelected ? 1.0 : 0.6,
-          strokeWeight: isSelected ? 6 : 4,
-          zIndex: isSelected ? 100 : 10 + index
-        }
-      });
-      rendererArray.push(renderer);
+    // Pick the polyline: the planned OSRM route first, synthetic route as fallback
+    let polylineStr = null;
+    if (hasPlannedRoute && lastDirectionsResult.routes[originalRouteIndex] && lastDirectionsResult.routes[originalRouteIndex].polyline) {
+      polylineStr = lastDirectionsResult.routes[originalRouteIndex].polyline;
     } else if (hasRouteData && currentRoutes[index] && currentRoutes[index].polyline) {
-      // Create custom polyline for synthetic routes
-      console.log(`🔄 Creating custom polyline for synthetic Route ${index + 1}`);
-      
-      try {
-        // Use Google's geometry library to decode polyline
-        const routePoints = google.maps.geometry.encoding.decodePath(currentRoutes[index].polyline);
-        
-        const customPolyline = new google.maps.Polyline({
-          path: routePoints,
-          geodesic: true,
-          strokeColor: routeColor,
-          strokeOpacity: isSelected ? 1.0 : 0.6,
-          strokeWeight: isSelected ? 6 : 4,
-          zIndex: isSelected ? 100 : 10 + index,
-          map: map
-        });
-        
-        // Add click handler to select this route
-        customPolyline.addListener('click', () => {
-          selectRoute(index);
-        });
-        
-        // Store in rendererArray for cleanup (wrap in object to match DirectionsRenderer interface)
-        rendererArray.push({
-          setMap: (mapInstance) => customPolyline.setMap(mapInstance)
-        });
-        
-        console.log(`✅ Custom polyline created for Route ${index + 1} with ${routePoints.length} points`);
-        
-      } catch (error) {
-        console.error(`❌ Error creating custom polyline for Route ${index + 1}:`, error);
-      }
+      console.log(`🔄 Using synthetic polyline for Route ${index + 1}`);
+      polylineStr = currentRoutes[index].polyline;
     }
+
+    if (!polylineStr) continue;
+
+    try {
+      // Decode the encoded polyline to [[lat, lng], ...] points for Leaflet
+      const routePoints = decodePolyline(polylineStr);
+
+      const routeLine = L.polyline(routePoints, {
+        color: routeColor,
+        opacity: isSelected ? 1.0 : 0.65,
+        weight: isSelected ? 8 : 5,
+        lineCap: 'round',
+        lineJoin: 'round'
+      }).addTo(map);
+
+      // Click a route on the map to select its card
+      routeLine.on('click', () => selectRoute(index));
+
+      rendererArray.push(routeLine);
+      combinedBounds.extend(routeLine.getBounds());
+
+      if (isSelected) routeLine.bringToFront();
+
+      console.log(`✅ Route ${index + 1} polyline rendered with ${routePoints.length} points`);
+    } catch (error) {
+      console.error(`❌ Error rendering polyline for Route ${index + 1}:`, error);
+    }
+  }
+
+  // Frame the map around all displayed routes
+  if (!combinedBounds.isEmpty()) {
+    map.fitBounds(combinedBounds, { padding: [40, 40] });
   }
 }
 
 /* --- 4. Helpers --- */
-window.getCurrentLocationForInput = function () {
+window.getCurrentLocationForInput = async function () {
   if (!navigator.geolocation) return alert("Geolocation not supported.");
 
   const btn = document.querySelector(".locate-me-btn");
   btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i>';
 
   navigator.geolocation.getCurrentPosition(
-    (pos) => {
+    async (pos) => {
       const crd = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-      const geocoder = new google.maps.Geocoder();
 
-      geocoder.geocode({ location: crd }, (results, status) => {
-        btn.innerHTML = '<i class="fa-solid fa-crosshairs"></i>';
-        if (status === "OK" && results[0]) {
-          document.getElementById("source").value = results[0].formatted_address;
-        } else {
-          document.getElementById("source").value = `${crd.lat.toFixed(5)}, ${crd.lng.toFixed(5)}`;
-        }
-        map.setCenter(crd);
-        map.setZoom(16);
+      // Reverse geocode via Nominatim (OpenStreetMap, free & keyless)
+      const address = await reverseGeocodeLocation(crd.lat, crd.lng);
+      btn.innerHTML = '<i class="fa-solid fa-crosshairs"></i>';
 
-        // Place / move the "You are here" marker
-        if (userMarker) userMarker.setMap(null);
-        userMarker = new google.maps.Marker({
-          position: crd,
-          map: map,
-          title: "Your Location",
-          icon: {
-            path: google.maps.SymbolPath.CIRCLE,
-            scale: 10,
-            fillColor: "#0ea5e9",
-            fillOpacity: 1,
-            strokeColor: "#ffffff",
-            strokeWeight: 3
-          },
-          zIndex: 999,
-          animation: google.maps.Animation.DROP
-        });
+      document.getElementById("source").value = address
+        ? address
+        : `${crd.lat.toFixed(5)}, ${crd.lng.toFixed(5)}`;
 
-        // Info bubble showing address
-        const label = (status === "OK" && results[0])
-          ? results[0].formatted_address
-          : `${crd.lat.toFixed(5)}, ${crd.lng.toFixed(5)}`;
-        const infoWindow = new google.maps.InfoWindow({
-          content: `<div style="font-size:13px;font-weight:600;padding:2px 4px">
+      map.setView([crd.lat, crd.lng], 16);
+
+      // Place / move the "You are here" marker (animated blue dot)
+      if (userMarker) map.removeLayer(userMarker);
+      const dotIcon = L.divIcon({
+        className: 'user-location-pin',
+        html: `<div style="width:22px;height:22px;border-radius:50%;background:#0ea5e9;border:3px solid #ffffff;
+                      box-shadow:0 0 0 6px rgba(14,165,233,0.25), 0 3px 8px rgba(0,0,0,0.35);"></div>`,
+        iconSize: [22, 22],
+        iconAnchor: [11, 11]
+      });
+      userMarker = L.marker([crd.lat, crd.lng], { icon: dotIcon, title: "Your Location", zIndexOffset: 1000 }).addTo(map);
+
+      // Info bubble showing address
+      const label = address ? address : `${crd.lat.toFixed(5)}, ${crd.lng.toFixed(5)}`;
+      userMarker.bindPopup(`<div style="font-size:13px;font-weight:600;padding:2px 4px">
                       <i style="color:#0ea5e9">📍</i> <b>You are here</b><br>
                       <span style="font-weight:400;color:#555">${label}</span>
-                    </div>`
-        });
-        infoWindow.open(map, userMarker);
-        userMarker.addListener("click", () => infoWindow.open(map, userMarker));
-      });
+                    </div>`).openPopup();
     },
     (err) => {
       btn.innerHTML = '<i class="fa-solid fa-crosshairs"></i>';
@@ -1240,7 +1300,7 @@ window.callEmergencyService = function(phoneNumber) {
     }
 };
 
-window.navigateToEmergencyService = function(serviceName, serviceLat, serviceLng, userLat, userLng) {
+window.navigateToEmergencyService = async function(serviceName, serviceLat, serviceLng, userLat, userLng) {
     console.log(`🗺️ Navigating to: ${serviceName}`);
     console.log(`📍 Service GPS: ${serviceLat}, ${serviceLng}`);
     console.log(`📍 User GPS: ${userLat}, ${userLng}`);
@@ -1251,48 +1311,41 @@ window.navigateToEmergencyService = function(serviceName, serviceLat, serviceLng
         try {
             closeEmergencySuggestionsModal();
             
-            if (!directionsService) {
-                directionsService = new google.maps.DirectionsService();
+            // ✅ Use exact GPS coordinates with OSRM (free, keyless routing)
+            const coords = `${userLng},${userLat};${serviceLng},${serviceLat}`;
+            const url = `${OSRM_BASE_URL}/route/v1/driving/${coords}?overview=full&geometries=polyline`;
+            console.log(`🗺️ OSRM emergency navigation request: ${url}`);
+
+            const response = await fetch(url);
+            const data = await response.json();
+
+            if (response.ok && data.code === 'Ok' && data.routes && data.routes.length > 0) {
+                clearRouteRenderers();
+
+                const routePoints = decodePolyline(data.routes[0].geometry);
+                const emergencyLine = L.polyline(routePoints, {
+                    color: '#dc3545',
+                    opacity: 1.0,
+                    weight: 7,
+                    lineCap: 'round',
+                    lineJoin: 'round'
+                }).addTo(map);
+
+                rendererArray = [emergencyLine];
+                map.fitBounds(emergencyLine.getBounds(), { padding: [40, 40] });
+
+                const route = data.routes[0];
+                console.log(`✅ Navigation set up for ${serviceName}`);
+                console.log(`📏 Distance: ${formatDistanceMeters(route.distance)}`);
+                console.log(`⏱️ Duration: ${formatDurationSeconds(route.duration)}`);
+            } else {
+                console.error('❌ OSRM routing failed:', data.code || response.status);
+                // Fallback: Open in Google Maps app with GPS coordinates (free deep link, no API key needed)
+                const googleMapsUrl = `https://maps.google.com/maps?saddr=${userLat},${userLng}&daddr=${serviceLat},${serviceLng}`;
+                alert(`⚠️ Unable to show route in map.\nOpening Google Maps...`);
+                window.open(googleMapsUrl, '_blank');
             }
-            
-            // ✅ FIX: Use exact GPS coordinates instead of address
-            const request = {
-                origin: new google.maps.LatLng(userLat, userLng),
-                destination: new google.maps.LatLng(serviceLat, serviceLng),  // ✅ GPS COORDINATES
-                travelMode: google.maps.TravelMode.DRIVING
-            };
-            
-            directionsService.route(request, (result, status) => {
-                if (status === 'OK') {
-                    if (rendererArray) {
-                        rendererArray.forEach(renderer => renderer.setMap(null));
-                        rendererArray = [];
-                    }
-                    
-                    const emergencyRenderer = new google.maps.DirectionsRenderer({
-                        map: map,
-                        directions: result,
-                        polylineOptions: {
-                            strokeColor: '#dc3545',
-                            strokeOpacity: 1.0,
-                            strokeWeight: 6
-                        }
-                    });
-                    
-                    rendererArray = [emergencyRenderer];
-                    map.fitBounds(result.routes[0].bounds);
-                    
-                    console.log(`✅ Navigation set up for ${serviceName}`);
-                    console.log(`📏 Distance: ${result.routes[0].legs[0].distance.text}`);
-                    console.log(`⏱️ Duration: ${result.routes[0].legs[0].duration.text}`);
-                } else {
-                    console.error('❌ Directions request failed:', status);
-                    // Fallback: Open in Google Maps app with GPS coordinates
-                    const googleMapsUrl = `https://maps.google.com/maps?saddr=${userLat},${userLng}&daddr=${serviceLat},${serviceLng}`;
-                    alert(`⚠️ Unable to show route in map.\\nOpening Google Maps...`);
-                    window.open(googleMapsUrl, '_blank');
-                }
-            });
+
             
         } catch (error) {
             console.error('❌ Navigation error:', error);
@@ -1396,34 +1449,26 @@ function updateFeedbackListUI() {
 function showCrimeIncidents(incidents) {
   clearCrimeVisualization();
   if (!incidents) return;
-  
-  const infoWindow = new google.maps.InfoWindow({ minWidth: 200 });
+
   incidents.forEach((inc) => {
     const config = crimeConfig[inc.type] || crimeConfig.default;
-    const marker = new google.maps.Marker({
-      position: { lat: inc.lat, lng: inc.lng },
-      map: map,
-      icon: {
-        path: google.maps.SymbolPath.CIRCLE,
-        scale: 7,
-        fillColor: config.color,
-        fillOpacity: 0.9,
-        strokeColor: "white",
-        strokeWeight: 1
-      }
-    });
-    
-    marker.addListener("mouseover", () => {
-      infoWindow.setContent(`<div><b>${inc.type.toUpperCase()}</b><br>${inc.description}</div>`);
-      infoWindow.open(map, marker);
-    });
-    
-    crimeMarkers.push({ marker });
+    const marker = L.circleMarker([inc.lat, inc.lng], {
+      radius: 8,
+      fillColor: config.color,
+      fillOpacity: 0.9,
+      color: "white",
+      weight: 1
+    }).addTo(map);
+
+    marker.bindPopup(`<div><b>${inc.type.toUpperCase()}</b><br>${inc.description}</div>`, { minWidth: 200 });
+    marker.on("mouseover", (e) => e.target.openPopup());
+
+    crimeMarkers.push(marker);
   });
 }
 
 function clearCrimeVisualization() {
-  crimeMarkers.forEach((m) => m.marker.setMap(null));
+  crimeMarkers.forEach((m) => map.removeLayer(m));
   crimeMarkers = [];
 }
 
@@ -1435,6 +1480,7 @@ const HEATMAP_WEIGHTS = {
 };
 
 function buildHeatmapPoints() {
+  // leaflet.heat data format: [lat, lng, intensity]
   const points = [];
 
   // Crime incidents from all loaded routes
@@ -1442,7 +1488,7 @@ function buildHeatmapPoints() {
     (route.crime_incidents || []).forEach(inc => {
       if (inc.lat && inc.lng) {
         const weight = HEATMAP_WEIGHTS[inc.type] || 1;
-        points.push({ location: new google.maps.LatLng(inc.lat, inc.lng), weight });
+        points.push([inc.lat, inc.lng, weight]);
       }
     });
   });
@@ -1450,7 +1496,7 @@ function buildHeatmapPoints() {
   // Community feedback markers
   allFeedbacks.forEach(fb => {
     if (fb.lat && fb.lng) {
-      points.push({ location: new google.maps.LatLng(fb.lat, fb.lng), weight: 2 });
+      points.push([fb.lat, fb.lng, 2]);
     }
   });
 
@@ -1463,7 +1509,7 @@ window.toggleHeatmap = function() {
 
   if (heatmapActive) {
     // Turn off
-    if (heatmapLayer) heatmapLayer.setMap(null);
+    if (heatmapLayer) map.removeLayer(heatmapLayer);
     heatmapActive = false;
     btn.classList.remove('active');
     btn.innerHTML = '<i class="fa-solid fa-fire"></i><span>Heatmap</span>';
@@ -1478,25 +1524,24 @@ window.toggleHeatmap = function() {
     return;
   }
 
-  // Create or update heatmap layer
+  // Create or update heatmap layer (leaflet.heat plugin)
   if (!heatmapLayer) {
-    heatmapLayer = new google.maps.visualization.HeatmapLayer({
-      data: points,
-      map: map,
+    heatmapLayer = L.heatLayer(points, {
       radius: 50,
-      opacity: 0.92,
-      gradient: [
-        'rgba(0,0,0,0)',
-        'rgba(255,220,0,0.85)',
-        'rgba(255,140,0,1)',
-        'rgba(255,60,0,1)',
-        'rgba(220,0,0,1)',
-        'rgba(160,0,0,1)'
-      ]
-    });
+      blur: 55,
+      minOpacity: 0.55,
+      max: 3,
+      gradient: {
+        0.2: 'rgba(255,220,0,0.85)',
+        0.4: 'rgba(255,140,0,1)',
+        0.6: 'rgba(255,60,0,1)',
+        0.8: 'rgba(220,0,0,1)',
+        1.0: 'rgba(160,0,0,1)'
+      }
+    }).addTo(map);
   } else {
-    heatmapLayer.setData(points);
-    heatmapLayer.setMap(map);
+    heatmapLayer.setLatLngs(points);
+    if (!map.hasLayer(heatmapLayer)) heatmapLayer.addTo(map);
   }
 
   heatmapActive = true;
@@ -1510,19 +1555,14 @@ window.toggleHeatmap = function() {
 function refreshHeatmapIfActive() {
   if (!heatmapActive || !heatmapLayer) return;
   const points = buildHeatmapPoints();
-  heatmapLayer.setData(points);
+  heatmapLayer.setLatLngs(points);
   console.log(`🔥 Heatmap refreshed: ${points.length} points`);
 }
 
 function clearHospitalsAndPolice() {
-  hospitalMarkers.forEach((m) => {
-    if (m.marker) m.marker.setMap(null);
-    if (m.infoWindow) m.infoWindow.close();
-  });
-  policeMarkers.forEach((m) => {
-    if (m.marker) m.marker.setMap(null);
-    if (m.infoWindow) m.infoWindow.close();
-  });
+  // Removing a Leaflet marker automatically closes its bound popup
+  hospitalMarkers.forEach((m) => map.removeLayer(m));
+  policeMarkers.forEach((m) => map.removeLayer(m));
   hospitalMarkers = [];
   policeMarkers = [];
 }
@@ -1540,17 +1580,18 @@ function createPinIcon(bgColor, emoji) {
     <circle cx="21" cy="21" r="14" fill="white" opacity="0.22"/>
     <text x="21" y="27" text-anchor="middle" font-size="17" font-family="Segoe UI Emoji,Apple Color Emoji,sans-serif">${emoji}</text>
   </svg>`;
-  return {
-    url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
-    scaledSize: new google.maps.Size(30, 38),
-    anchor: new google.maps.Point(15, 36)
-  };
+  return L.icon({
+    iconUrl: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+    iconSize: [30, 38],
+    iconAnchor: [15, 36],
+    popupAnchor: [0, -34]
+  });
 }
 
-function makePOIInfoWindow(color, titleHtml, place, defaultPhone) {
+function makePOIPopupHtml(color, titleHtml, place, defaultPhone) {
   const name = (place.name || '').replace(/'/g, "\\'");
-  return new google.maps.InfoWindow({
-    content: `
+  const center = map.getCenter();
+  return `
       <div style="padding:14px;max-width:260px;font-family:'Inter',sans-serif">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
           <div style="width:4px;height:36px;background:${color};border-radius:2px;flex-shrink:0"></div>
@@ -1561,12 +1602,11 @@ function makePOIInfoWindow(color, titleHtml, place, defaultPhone) {
           📞 ${place.phone || defaultPhone}
         </p>
         ${place.distance ? `<p style="margin:4px 0;font-size:11px;color:#999">📍 ${place.distance} from route</p>` : ''}
-        <button onclick="navigateToEmergencyService('${name}',${place.lat},${place.lng},${map.getCenter().lat()},${map.getCenter().lng()})"
+        <button onclick="navigateToEmergencyService('${name}',${place.lat},${place.lng},${center.lat},${center.lng})"
           style="margin-top:10px;background:${color};color:white;border:none;padding:7px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-weight:700;width:100%">
           🗺 Navigate Here
         </button>
-      </div>`
-  });
+      </div>`;
 }
 
 function showHospitalsAndPolice(routeData) {
@@ -1618,19 +1658,17 @@ function showHospitalsAndPolice(routeData) {
     console.log(`📍 Displaying ${places.length} ${defaultTitle}s`);
 
     places.forEach(place => {
-      const marker = new google.maps.Marker({
-        position: { lat: place.lat, lng: place.lng },
-        map,
+      const marker = L.marker([place.lat, place.lng], {
         title: place.name || defaultTitle,
         icon,
-        animation: google.maps.Animation.DROP,
-        zIndex: 200
-      });
+        zIndexOffset: 200,
+        riseOnHover: true
+      }).addTo(map);
 
       const title = `${place.name || defaultTitle}`;
-      const iw = makePOIInfoWindow(color, title, place, phone);
-      marker.addListener('click', () => iw.open(map, marker));
-      store.push({ marker, infoWindow: iw });
+      const popupHtml = makePOIPopupHtml(color, title, place, phone);
+      marker.bindPopup(popupHtml);
+      store.push(marker);
     });
   });
 
@@ -1638,50 +1676,34 @@ function showHospitalsAndPolice(routeData) {
 }
 
 function clearFeedback() {
-    feedbackMarkers.forEach(item => {
-        if (item.marker) item.marker.setMap(null);
-        if (item.infoWindow) item.infoWindow.close();
-    });
+    feedbackMarkers.forEach((m) => map.removeLayer(m));
     feedbackMarkers = [];
 }
 
 function addFeedbackMarker(fb) {
     const config = feedbackConfig[fb.type] || feedbackConfig.other;
-    
-    const marker = new google.maps.Marker({
-        position: { lat: fb.lat, lng: fb.lng },
-        map: map,
-        title: `${config.label}: ${fb.description}`,
-        icon: {
-            path: google.maps.SymbolPath.CIRCLE,
-            scale: 8,
-            fillColor: config.color,
-            fillOpacity: 0.8,
-            strokeColor: "white",
-            strokeWeight: 2
-        }
-    });
-   
-    const infoWindow = new google.maps.InfoWindow({
-        content: `
+
+    const marker = L.circleMarker([fb.lat, fb.lng], {
+        radius: 9,
+        fillColor: config.color,
+        fillOpacity: 0.8,
+        color: "white",
+        weight: 2
+    }).addTo(map);
+
+    marker.bindPopup(`
             <div style="padding: 10px;">
                 <h4><i class="${config.icon}" style="color: ${config.color};"></i> ${config.label}</h4>
                 <p>${fb.description || 'No description'}</p>
                 <small><i class="fa-solid fa-location-dot"></i> ${fb.lat.toFixed(6)}, ${fb.lng.toFixed(6)}</small>
             </div>
-        `
-    });
-   
-    marker.addListener("click", () => {
-        infoWindow.open(map, marker);
-    });
-   
-    feedbackMarkers.push({ marker, infoWindow });
+        `);
+
+    feedbackMarkers.push(marker);
 }
 
 window.focusOnFeedback = function(lat, lng) {
-    map.panTo({ lat, lng });
-    map.setZoom(16);
+    map.setView([lat, lng], 16);
 };
 
 /* --- 8. Loading Animation --- */
@@ -1757,8 +1779,7 @@ window.clearAllData = async function () {
                 updateFeedbackListUI();
                 
                 // Clear displayed routes
-                rendererArray.forEach((r) => r.setMap(null));
-                rendererArray = [];
+                clearRouteRenderers();
                 currentRoutes = [];
                 
                 // Clear route cards
@@ -1819,7 +1840,7 @@ window.testBackendConnection = async function() {
         if (response.ok) {
             const data = await response.json();
             console.log('✅ Backend connection successful!', data);
-            alert(`✅ Backend Connection Test Successful!\\n\\nGroq AI: ${data.groq_configured ? 'Available' : 'Not Available'}\\nGoogle Places API: ${data.google_places_available ? 'Available' : 'Not Available'}\\n\\nPrimary AI: ${data.primary_ai}`);
+            alert(`✅ Backend Connection Test Successful!\n\nGroq AI: ${data.groq_configured ? 'Available' : 'Not Available'}\n\nPOI Service: ${data.poi_provider || 'OpenStreetMap (Overpass API)'}\n\nPrimary AI: ${data.primary_ai}`);
         } else {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }

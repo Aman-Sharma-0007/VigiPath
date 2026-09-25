@@ -271,8 +271,9 @@ body.night-mode .ai-explanation-panel {
 }
 
 /* --- Heatmap FAB & Legend --- */
+/* z-index 1000: must sit above Leaflet map panes (up to 700) and controls (800-1000) */
 .map-fab-group {
-    position: absolute; bottom: 24px; right: 16px; z-index: 100;
+    position: absolute; bottom: 24px; right: 16px; z-index: 1000;
     display: flex; flex-direction: column; gap: 10px;
 }
 .map-fab {
@@ -296,7 +297,7 @@ body.night-mode .map-fab { background: #1e293b; color: #e2e8f0; border-color: #3
 body.night-mode .map-fab.active { background: #ef4444; color: white; border-color: #ef4444; }
 
 .heatmap-legend {
-    position: absolute; bottom: 80px; right: 16px; z-index: 100;
+    position: absolute; bottom: 80px; right: 16px; z-index: 1000;
     background: var(--white); border-radius: 12px; padding: 12px 16px;
     box-shadow: var(--shadow); border: 1px solid var(--border);
     min-width: 200px; animation: fadeIn 0.25s ease;
@@ -312,6 +313,11 @@ body.night-mode .map-fab.active { background: #ef4444; color: white; border-colo
 .legend-note { font-size: 0.7rem; color: var(--text-light); }
 body.night-mode .heatmap-legend { background: #1e293b; border-color: #334155; }
 body.night-mode .legend-note, body.night-mode .legend-low, body.night-mode .legend-high { color: #94a3b8; }
+
+/* --- Leaflet (OpenStreetMap) map tweaks --- */
+#map { background: #e8ecef; } /* tile load placeholder */
+body.night-mode .leaflet-tile-pane { filter: brightness(0.6) saturate(0.85); }
+body.night-mode #map { background: #0f172a; }
 
 /* --- Modals --- */
 .modal-overlay {

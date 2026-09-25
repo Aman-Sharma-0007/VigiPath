@@ -7,6 +7,8 @@ import random
 import sqlite3
 import json
 import os
+import re
+import time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -54,11 +56,37 @@ def after_request(response):
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Load API keys from environment variables
+# NOTE: SafeRoute now uses free, keyless OpenStreetMap services (Overpass API for
+# POIs, OSRM for routing, Nominatim for geocoding) and no longer requires a Google
+# Maps API key. The key below is kept ONLY for the deprecated /get-maps-config
+# endpoint so older cached frontends keep working until they reload.
 API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
 if not API_KEY:
-    print("❌ CRITICAL ERROR: GOOGLE_MAPS_API_KEY not found in environment variables!")
-    print("Please set GOOGLE_MAPS_API_KEY in your .env file or environment before running.")
-    print("Get your key from: https://console.cloud.google.com")
+    print("ℹ️ GOOGLE_MAPS_API_KEY not set (not required — SafeRoute uses free OpenStreetMap services).")
+
+# --- Free & keyless map services (replaced Google Maps Platform) ---
+OSRM_BASE_URL = "https://router.project-osrm.org"
+NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",   # mirror fallback
+]
+HTTP_USER_AGENT = "SafeRoute/1.0 (OpenStreetMap-based safety navigation, hackathon project)"
+
+# Internal POI type keys -> OpenStreetMap tag filters
+OSM_POI_TAG_FILTERS = {
+    "hospital":    [("amenity", "hospital"), ("healthcare", "hospital")],
+    "police":      [("amenity", "police")],
+    "gas_station": [("amenity", "fuel")],
+    "lodging":     [("tourism", "hotel"), ("tourism", "guest_house"), ("tourism", "motel")],
+}
+
+OSM_POI_DEFAULTS = {
+    "hospital":    {"name": "Unknown Hospital",  "phone": "Emergency: 112"},
+    "police":      {"name": "Police Station",    "phone": "Emergency: 100"},
+    "gas_station": {"name": "Petrol Pump",       "phone": "Roadside: 1073"},
+    "lodging":     {"name": "Hotel / Safe Place", "phone": "Emergency: 112"},
+}
 
 # Groq AI Configuration (Primary AI Provider - Fast & Unlimited)
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
@@ -222,275 +250,363 @@ def calculate_final_safety_score(hospitals, police, lights, crime_risk, distance
     total = hospital_score + police_score + light_score * 0.3 + crime_penalty + distance_penalty
     return max(0, min(100, round(total)))
 
+def _osm_classify_poi(tags):
+    """Map an OSM element's tags to an internal POI type key (or None)."""
+    amenity = tags.get("amenity")
+    tourism = tags.get("tourism")
+    healthcare = tags.get("healthcare")
+    if amenity == "hospital" or healthcare == "hospital":
+        return "hospital"
+    if amenity == "police":
+        return "police"
+    if amenity == "fuel":
+        return "gas_station"
+    if tourism in ("hotel", "guest_house", "motel"):
+        return "lodging"
+    return None
+
+def _element_location(el):
+    """Get (lat, lng) from an Overpass element (node coords or way/relation center)."""
+    if el.get("center"):
+        return el["center"].get("lat"), el["center"].get("lon")
+    return el.get("lat"), el.get("lon")
+
+def _overpass_query_elements(query, timeout=20):
+    """POST a query to the Overpass API with mirror fallback; returns element list."""
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            response = requests.post(endpoint, data={"data": query}, timeout=timeout,
+                                     headers={"User-Agent": HTTP_USER_AGENT})
+            if response.status_code == 200:
+                return response.json().get("elements", [])
+            print(f"⚠️ Overpass {endpoint} responded HTTP {response.status_code}")
+        except requests.Timeout:
+            print(f"⚠️ Overpass timeout at {endpoint}")
+        except Exception as e:
+            print(f"⚠️ Overpass error at {endpoint}: {e}")
+    return []
+
+def fetch_osm_pois_around(points, radius_m=5000, max_points=16):
+    """
+    Fetch POI candidates of every type around the given (lat, lng) sample points
+    using a SINGLE Overpass API query (free, no API key).
+    Returns {type_key: [ {name, address, phone, lat, lng}, ... ]} deduplicated.
+    """
+    empty = {k: [] for k in OSM_POI_TAG_FILTERS}
+
+    # Quantize + dedupe sample points to keep the query compact
+    unique_points = []
+    seen = set()
+    for lat, lng in points:
+        key = (round(lat, 3), round(lng, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_points.append(key)
+    unique_points = unique_points[:max_points]
+    if not unique_points:
+        return empty
+
+    statements = []
+    for lat, lng in unique_points:
+        for filters in OSM_POI_TAG_FILTERS.values():
+            for k, v in filters:
+                statements.append(f"nwr(around:{int(radius_m)},{lat},{lng})[{k}={v}];")
+    query = "[out:json][timeout:20];\n(\n  " + "\n  ".join(statements) + "\n);\nout center 800;"
+
+    print(f"🌍 Overpass query: {len(statements)} tag filters around {len(unique_points)} points")
+    elements = _overpass_query_elements(query)
+
+    pois = {k: [] for k in OSM_POI_TAG_FILTERS}
+    seen_ids = set()
+    for el in elements:
+        el_id = (el.get("type"), el.get("id"))
+        if el_id in seen_ids:
+            continue
+        seen_ids.add(el_id)
+        tags = el.get("tags") or {}
+        ptype = _osm_classify_poi(tags)
+        if not ptype:
+            continue
+        lat, lng = _element_location(el)
+        if lat is None or lng is None:
+            continue
+        addr_parts = [tags.get("addr:housenumber"), tags.get("addr:street"),
+                      tags.get("addr:suburb"), tags.get("addr:city")]
+        pois[ptype].append({
+            "name": tags.get("name") or OSM_POI_DEFAULTS[ptype]["name"],
+            "address": ", ".join(p for p in addr_parts if p) or None,
+            "phone": tags.get("phone") or tags.get("contact:phone") or tags.get("contact:mobile"),
+            "lat": lat,
+            "lng": lng,
+        })
+
+    print(f"✅ Overpass found: {len(pois['hospital'])} hospitals, {len(pois['police'])} police, "
+          f"{len(pois['gas_station'])} petrol pumps, {len(pois['lodging'])} hotels")
+    return pois
+
+def _collect_route_sample_points(route_points):
+    """
+    Evenly-distributed sample points along a route, based on cumulative distance
+    (same strategy the previous Google Places implementation used).
+    """
+    total_points = len(route_points)
+    if total_points <= 10:
+        return list(route_points)
+
+    cumulative_distances = [0.0]
+    total_distance_km = 0.0
+    for i in range(total_points - 1):
+        total_distance_km += calculate_distance(
+            route_points[i][0], route_points[i][1],
+            route_points[i + 1][0], route_points[i + 1][1]
+        )
+        cumulative_distances.append(total_distance_km)
+
+    # Sample every ~2.5km so 5km-radius searches overlap — no gaps in coverage
+    num_samples = max(5, min(12, int(total_distance_km / 2.5) + 1))
+
+    samples = [route_points[0]]
+    for i in range(1, num_samples - 1):
+        target_distance = (i * total_distance_km) / (num_samples - 1)
+        closest_idx = min(range(len(cumulative_distances)),
+                          key=lambda idx: abs(cumulative_distances[idx] - target_distance))
+        if route_points[closest_idx] not in samples:
+            samples.append(route_points[closest_idx])
+    if route_points[-1] not in samples:
+        samples.append(route_points[-1])
+    return samples
+
+def prefetch_route_pois(route_points_list):
+    """Fetch POI candidates for ALL routes with a single Overpass query."""
+    points = []
+    for route_points in route_points_list:
+        if route_points:
+            points.extend(_collect_route_sample_points(route_points))
+    return fetch_osm_pois_around(points)
+
+def _select_evenly_distributed_places(places, route_points, max_results):
+    """
+    Filter candidate places to those near THIS route and pick an evenly
+    distributed subset along it (0.0 = start, 1.0 = end) — same behaviour as
+    the previous Google Places implementation.
+    """
+    if not places or not route_points:
+        return []
+
+    search_radius_m = 5000.0
+    if len(route_points) > 20:
+        sample_for_distance = route_points[::max(1, len(route_points) // 20)]
+        scale = max(1, len(route_points) // 20)
+    else:
+        sample_for_distance = route_points
+        scale = 1
+
+    all_places = []
+    seen_places = set()
+    for place in places:
+        place_lat, place_lng = place.get("lat"), place.get("lng")
+        if place_lat is None or place_lng is None:
+            continue
+
+        # Coarse dedup (~100m precision)
+        place_key_coarse = (round(place_lat, 3), round(place_lng, 3))
+        if place_key_coarse in seen_places:
+            continue
+        seen_places.add(place_key_coarse)
+
+        # Distance from route and proportional position along it
+        distances = [haversine(place_lat, place_lng, rp[0], rp[1]) for rp in sample_for_distance]
+        min_idx = distances.index(min(distances))
+        min_distance = distances[min_idx]
+        if min_distance > search_radius_m:
+            continue  # not near this route
+        distance_km = min_distance / 1000.0
+        nearest_full_idx = min_idx * scale
+        route_position = nearest_full_idx / max(1, len(route_points) - 1)
+
+        all_places.append({
+            "name": place.get("name"),
+            "address": place.get("address") or "Address not available",
+            "phone": place.get("phone"),
+            "lat": place_lat,
+            "lng": place_lng,
+            "distance_from_route_km": round(distance_km, 2),
+            "distance_from_route": f"{distance_km:.1f} km",
+            "route_position": round(route_position, 3),
+        })
+
+    # Evenly distribute by route_position (0.0=start -> 1.0=end)
+    all_places.sort(key=lambda x: x["route_position"])
+
+    final_places = []
+    if len(all_places) <= max_results:
+        final_places = all_places
+    else:
+        # Slice the 0.0-1.0 range into equal bands, pick the closest-to-route
+        # candidate from each band
+        for i in range(max_results):
+            band_start = i / max_results
+            band_end = (i + 1) / max_results
+            candidates = [p for p in all_places if band_start <= p["route_position"] < band_end]
+            if not candidates:
+                continue
+            best = min(candidates, key=lambda x: x["distance_from_route_km"])
+            # Skip if a very nearby place was already selected (300m threshold)
+            too_close = any(
+                haversine(best["lat"], best["lng"], sel["lat"], sel["lng"]) < 300.0
+                for sel in final_places
+            )
+            if not too_close:
+                final_places.append(best)
+
+    return final_places
+
+def _geocode_with_nominatim(query):
+    """
+    Geocode a free-text location (or pass through a "lat,lng" pair) to (lat, lng)
+    using Nominatim (OpenStreetMap, free & keyless). Returns None on failure.
+    """
+    query = (query or "").strip()
+    if not query:
+        return None
+
+    coord_match = re.match(r'^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$', query)
+    if coord_match:
+        lat, lng = float(coord_match.group(1)), float(coord_match.group(2))
+        if abs(lat) <= 90 and abs(lng) <= 180:
+            return (lat, lng)
+
+    try:
+        response = requests.get(
+            f"{NOMINATIM_BASE_URL}/search",
+            params={"q": query, "format": "json", "limit": 1},
+            headers={"User-Agent": HTTP_USER_AGENT},
+            timeout=10
+        )
+        if response.status_code == 200:
+            results = response.json()
+            if results:
+                return (float(results[0]["lat"]), float(results[0]["lon"]))
+        else:
+            print(f"⚠️ Nominatim geocoding HTTP {response.status_code} for '{query}'")
+    except Exception as e:
+        print(f"⚠️ Nominatim geocoding error for '{query}': {e}")
+    return None
+
+def _osrm_plan_routes(source, destination):
+    """
+    Plan alternative driving routes with OSRM (free, keyless). Geocodes the
+    endpoints via Nominatim first. Returns a raw_routes list (same shape the
+    frontend sends) or None on failure.
+    """
+    try:
+        origin = _geocode_with_nominatim(source)
+        time.sleep(1.1)  # Nominatim fair-use policy: max 1 request/second
+        dest = _geocode_with_nominatim(destination)
+
+        if not origin or not dest:
+            print(f"⚠️ Could not geocode '{source}' -> {origin}, '{destination}' -> {dest}")
+            return None
+
+        url = f"{OSRM_BASE_URL}/route/v1/driving/{origin[1]},{origin[0]};{dest[1]},{dest[0]}"
+        response = requests.get(
+            url,
+            params={"alternatives": "3", "overview": "full", "geometries": "polyline"},
+            headers={"User-Agent": HTTP_USER_AGENT},
+            timeout=15
+        )
+        data = response.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            print(f"⚠️ OSRM response: {data.get('code')}")
+            return None
+
+        routes = []
+        for i, r in enumerate(data["routes"]):
+            routes.append({
+                "index": i,
+                "polyline": r.get("geometry", ""),
+                "distance_text": f"{r['distance'] / 1000:.1f} km",
+                "distance_meters": int(r["distance"]),
+                "duration_text": f"{int(r['duration'] / 60)} mins",
+                "duration_seconds": int(r["duration"]),
+                "summary": ""
+            })
+        print(f"✅ OSRM planned {len(routes)} routes ({origin} -> {dest})")
+        return routes
+    except Exception as e:
+        print(f"⚠️ OSRM route planning failed: {e}")
+        traceback.print_exc()
+        return None
+
 def get_places_along_route(route_points, place_type="hospital", max_results=10):
     """
-    Find real hospitals or police stations along a route path using Google Places API.
-    Samples points along the route and searches for places within 2km radius.
-    Optimized to avoid blocking - limits API calls and uses faster search strategy.
-    
+    Find real hospitals / police stations / petrol pumps / hotels along a route
+    using the OpenStreetMap Overpass API (free, no API key). Samples points along
+    the route and searches for places within a 5km radius.
+
     Args:
         route_points: List of (lat, lng) tuples representing the route
-        place_type: "hospital" or "police"
+        place_type: "hospital", "police", "gas_station" or "lodging"
         max_results: Maximum number of places to return
-    
+
     Returns:
         List of place dictionaries with name, lat, lng, address, phone, distance
     """
-    if not route_points or len(route_points) == 0:
-        return []
-    
     try:
-        url = "https://places.googleapis.com/v1/places:searchNearby"
-        headers = {
-            'Content-Type': 'application/json',
-            'X-Goog-Api-Key': API_KEY,
-            'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.location,places.internationalPhoneNumber,places.types'
-        }
-        
-        # Distribute search points evenly across the ENTIRE route based on DISTANCE
-        # This ensures we cover the full route length, not just the beginning
-        total_points = len(route_points)
-        total_distance_km = 0.0  # Initialize for logging
-        
-        if total_points <= 3:
-            sample_points = route_points
-        elif total_points <= 10:
-            # Use all points for very short routes
-            sample_points = route_points
-            # Calculate total distance for logging
-            for i in range(len(route_points) - 1):
-                total_distance_km += calculate_distance(
-                    route_points[i][0], route_points[i][1],
-                    route_points[i+1][0], route_points[i+1][1]
-                )
-        else:
-            # Calculate cumulative distances along the route
-            cumulative_distances = [0.0]  # Distance from start at each point
-            
-            for i in range(len(route_points) - 1):
-                segment_distance = calculate_distance(
-                    route_points[i][0], route_points[i][1],
-                    route_points[i+1][0], route_points[i+1][1]
-                )
-                total_distance_km += segment_distance
-                cumulative_distances.append(total_distance_km)
-            
-            # Determine number of samples based on route length
-            # Sample every 2.5km so 5km radius searches overlap heavily — no gaps in coverage
-            target_sample_interval_km = 2.5
-            num_samples = max(5, min(12, int(total_distance_km / target_sample_interval_km) + 1))
-            
-            print(f"   📏 Route distance: {total_distance_km:.2f} km, will use {num_samples} evenly distributed search points")
-            
-            # Distribute samples evenly along the route based on cumulative distance
-            sample_points = []
-            sample_distances = []
-            
-            # Always include start point
-            sample_points.append(route_points[0])
-            sample_distances.append(0.0)
-            
-            # Calculate target distances for evenly spaced samples
-            if num_samples > 2:
-                # Distribute middle points evenly
-                for i in range(1, num_samples - 1):
-                    target_distance = (i * total_distance_km) / (num_samples - 1)
-                    sample_distances.append(target_distance)
-                    
-                    # Find the route point closest to this target distance
-                    closest_idx = 0
-                    min_diff = float('inf')
-                    for idx, cum_dist in enumerate(cumulative_distances):
-                        diff = abs(cum_dist - target_distance)
-                        if diff < min_diff:
-                            min_diff = diff
-                            closest_idx = idx
-                    
-                    if route_points[closest_idx] not in sample_points:
-                        sample_points.append(route_points[closest_idx])
-            
-            # Always include end point
-            if route_points[-1] not in sample_points:
-                sample_points.append(route_points[-1])
-                sample_distances.append(total_distance_km)
-        
-        print(f"🔍 Searching for {place_type}s along route with {len(sample_points)} evenly distributed sample points (from {total_points} total route points)...")
-        if len(sample_points) > 2 and total_distance_km > 0:
-            print(f"   📍 Coverage: Start (0km) → {len(sample_points)-2} middle sections → End ({total_distance_km:.1f}km)")
-        else:
-            print(f"   📍 Coverage: Start → End")
-        
-        all_places = []
-        seen_places = set()  # To deduplicate by coordinates
-        
-        # 5km radius — wide enough to catch hospitals/police slightly off the route path
-        search_radius = 5000.0
-        
-        # Use all sample points (they're already limited and evenly distributed)
-        # No need to truncate further
-        
-        for idx, (lat, lng) in enumerate(sample_points):
-            try:
-                search_data = {
-                    "includedTypes": [place_type],
-                    "maxResultCount": 10,
-                    "locationRestriction": {
-                        "circle": {
-                            "center": {
-                                "latitude": lat,
-                                "longitude": lng
-                            },
-                            "radius": search_radius
-                        }
-                    },
-                    "rankPreference": "DISTANCE"
-                }
-                
-                response = requests.post(url, json=search_data, headers=headers, timeout=5)  # Reduced timeout
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    places = result.get('places', [])
-                    
-                    for place in places:
-                        try:
-                            place_lat = place.get('location', {}).get('latitude')
-                            place_lng = place.get('location', {}).get('longitude')
-                            
-                            if not place_lat or not place_lng:
-                                continue
-                            
-                            # Deduplicate: skip if same physical place already collected
-                            min_distance_between_places_m = 200.0
-                            is_too_close = False
-                            
-                            for existing_place in all_places:
-                                distance_between = haversine(
-                                    place_lat, place_lng,
-                                    existing_place['lat'], existing_place['lng']
-                                )
-                                if distance_between < min_distance_between_places_m:
-                                    is_too_close = True
-                                    break
-                            
-                            if is_too_close:
-                                continue  # Skip places that are too close to existing ones
-                            
-                            # Also check against seen_places set for faster lookup
-                            # Use 3 decimal places (~100m precision) for initial deduplication
-                            place_key_coarse = (round(place_lat, 3), round(place_lng, 3))
-                            if place_key_coarse in seen_places:
-                                continue  # Skip if very close to a previously seen place
-                            
-                            seen_places.add(place_key_coarse)
-                            
-                            name = place.get('displayName', {}).get('text', f'Unknown {place_type.title()}')
-                            address = place.get('formattedAddress', 'Address not available')
-                            phone = place.get('internationalPhoneNumber', f'Emergency: {"112" if place_type == "hospital" else "100"}')
-                            
-                            # Calculate distance from route and position along route
-                            sample_for_distance = route_points[::max(1, len(route_points)//20)] if len(route_points) > 20 else route_points
-                            distances = [haversine(place_lat, place_lng, rp[0], rp[1]) for rp in sample_for_distance]
-                            min_idx = distances.index(min(distances))
-                            min_distance = distances[min_idx]
-                            distance_km = min_distance / 1000.0
+        sample_points = _collect_route_sample_points(route_points)
+        print(f"🔍 Searching for {place_type}s along route with {len(sample_points)} evenly distributed sample points (from {len(route_points)} total route points)...")
 
-                            # Route position: 0.0 = start, 1.0 = end
-                            # Use the sample index scaled back to full route proportion
-                            scale = max(1, len(route_points) // 20) if len(route_points) > 20 else 1
-                            nearest_full_idx = min_idx * scale
-                            route_position = nearest_full_idx / max(1, len(route_points) - 1)
-
-                            place_data = {
-                                "name": name,
-                                "address": address,
-                                "phone": phone,
-                                "lat": place_lat,
-                                "lng": place_lng,
-                                "distance_from_route_km": round(distance_km, 2),
-                                "distance_from_route": f"{distance_km:.1f} km",
-                                "route_position": round(route_position, 3)
-                            }
-
-                            all_places.append(place_data)
-
-                        except Exception as e:
-                            print(f"⚠️ Error processing {place_type}: {e}")
-                            continue
-
-            except requests.Timeout:
-                print(f"⚠️ Timeout searching for {place_type} at point {idx}")
-                continue
-            except Exception as e:
-                print(f"⚠️ Error searching at point {idx}: {e}")
-                continue
-        
-        # Evenly distribute by route_position value (0.0=start → 1.0=end),
-        # NOT by list index — this guarantees middle segments are always checked.
-        all_places.sort(key=lambda x: x['route_position'])
-
-        final_places = []
-        if len(all_places) <= max_results:
-            final_places = all_places
-        else:
-            # Slice the 0.0–1.0 range into max_results equal bands
-            # and pick the closest-to-route candidate from each band
-            for i in range(max_results):
-                band_start = i / max_results
-                band_end   = (i + 1) / max_results
-                candidates = [
-                    p for p in all_places
-                    if band_start <= p['route_position'] < band_end
-                ]
-                if not candidates:
-                    continue
-                best = min(candidates, key=lambda x: x['distance_from_route_km'])
-                # Skip if a very nearby place was already selected (300m threshold)
-                too_close = any(
-                    haversine(best['lat'], best['lng'], sel['lat'], sel['lng']) < 300.0
-                    for sel in final_places
-                )
-                if not too_close:
-                    final_places.append(best)
+        pois = fetch_osm_pois_around(sample_points)
+        final_places = _select_evenly_distributed_places(pois.get(place_type, []), route_points, max_results)
 
         print(f"✅ Found {len(final_places)} evenly distributed {place_type}s along route")
         return final_places
-        
+
     except Exception as e:
         print(f"❌ Error in get_places_along_route: {e}")
-        import traceback
         traceback.print_exc()
         return []
 
-def get_safety_counts(route_points):
+def get_safety_counts(route_points, prefetched_pois=None):
     """
     Get real hospital and police station counts and locations along the route.
-    Uses Google Places API to find actual emergency services along the route path.
-    Optimized with timeout to prevent blocking route responses.
-    
+    Uses OpenStreetMap data via the Overpass API (free, no API key required).
+
     Args:
         route_points: List of (lat, lng) tuples from decoded polyline
-    
+        prefetched_pois: optional result of prefetch_route_pois() to reuse a
+                         single Overpass query across all routes in one request
+
     Returns:
         Tuple of (counts_dict, locations_dict)
     """
-    print(f"🏥 Searching for hospitals, police, petrol pumps and hotels along route...")
+    print(f"🏥 Searching for hospitals, police, petrol pumps and hotels along route (OpenStreetMap)...")
 
-    def fetch(place_type, max_results):
+    if prefetched_pois is None:
         try:
-            return get_places_along_route(route_points, place_type=place_type, max_results=max_results)
+            prefetched_pois = prefetch_route_pois([route_points])
+        except Exception as e:
+            print(f"⚠️ POI prefetch failed: {e}")
+            prefetched_pois = {k: [] for k in OSM_POI_TAG_FILTERS}
+
+    def select(place_type, max_results):
+        try:
+            return _select_evenly_distributed_places(
+                prefetched_pois.get(place_type, []), route_points, max_results
+            )
         except Exception as e:
             print(f"⚠️ Error finding {place_type}: {e}")
             return []
 
-    hospitals       = fetch("hospital",    max_results=6)
-    police_stations = fetch("police",      max_results=4)
-    gas_stations    = fetch("gas_station", max_results=4)
-    hotels          = fetch("lodging",     max_results=3)
+    hospitals       = select("hospital",    max_results=6)
+    police_stations = select("police",      max_results=4)
+    gas_stations    = select("gas_station", max_results=4)
+    hotels          = select("lodging",     max_results=3)
 
-    def fmt(places):
+    def fmt(places, default_phone):
         return [{"lat": p["lat"], "lng": p["lng"], "name": p["name"],
-                 "address": p["address"], "phone": p["phone"],
+                 "address": p["address"], "phone": p["phone"] or default_phone,
                  "distance": p["distance_from_route"]} for p in places]
 
     counts = {
@@ -499,10 +615,10 @@ def get_safety_counts(route_points):
     }
 
     locations = {
-        "hospitals":    fmt(hospitals),
-        "police":       fmt(police_stations),
-        "gas_stations": fmt(gas_stations),
-        "hotels":       fmt(hotels)
+        "hospitals":    fmt(hospitals,       OSM_POI_DEFAULTS["hospital"]["phone"]),
+        "police":       fmt(police_stations, OSM_POI_DEFAULTS["police"]["phone"]),
+        "gas_stations": fmt(gas_stations,    OSM_POI_DEFAULTS["gas_station"]["phone"]),
+        "hotels":       fmt(hotels,          OSM_POI_DEFAULTS["lodging"]["phone"])
     }
 
     print(f"📊 Route POIs: {len(hospitals)} hospitals, {len(police_stations)} police, "
@@ -532,297 +648,59 @@ def generate_safety_warnings(crime_incidents, amenities, light_score):
             warnings.append("🌃 Higher risk at night - extra caution advised")
     return warnings[:3]
 
-def get_nearby_places_with_google_api(lat, lng):
+def get_nearby_places_with_osm(lat, lng):
     """
-    Use Google Places API (New) to find real nearby emergency services for ANY location worldwide
+    Find real nearby emergency services for ANY location worldwide using the
+    OpenStreetMap Overpass API (free, no API key). Replaces the former Google
+    Places API (New) implementation — returns the same response shape.
     """
     try:
-        print(f"🌐 Searching for emergency services near {lat}, {lng} using Google Places API (New)")
-        
-        url = "https://places.googleapis.com/v1/places:searchNearby"
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'X-Goog-Api-Key': API_KEY,
-            'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.location,places.rating,places.internationalPhoneNumber,places.types'
-        }
-        
-        # Search for hospitals
-        hospitals = []
-        print(f"🏥 Searching for hospitals within 10km...")
-        
-        hospital_data = {
-            "includedTypes": ["hospital"],
-            "maxResultCount": 10,
-            "locationRestriction": {
-                "circle": {
-                    "center": {
-                        "latitude": lat,
-                        "longitude": lng
-                    },
-                    "radius": 5000.0  # Reduced to 5km for closer results
-                }
-            },
-            "rankPreference": "DISTANCE"  # Prioritize closest results
-        }
-        
-        response = requests.post(url, json=hospital_data, headers=headers, timeout=10)
-        print(f"🔍 Google Places API Response Status: {response.status_code}")
-        
-        if response.status_code == 200:
-            result = response.json()
-            places = result.get('places', [])
-            print(f"📊 Google Places API returned {len(places)} hospitals")
-            
-            # Calculate distances and sort by proximity
-            hospitals_with_distance = []
-            for place in places:
-                try:
-                    name = place.get('displayName', {}).get('text', 'Unknown Hospital')
-                    address = place.get('formattedAddress', 'Address not available')
-                    phone = place.get('internationalPhoneNumber', 'Emergency: 112')
-                    rating = place.get('rating', 0)
-                    
-                    # Calculate distance
-                    place_lat = place.get('location', {}).get('latitude')
-                    place_lng = place.get('location', {}).get('longitude')
-                    
-                    if place_lat and place_lng:
-                        distance = calculate_distance(lat, lng, place_lat, place_lng)
-                        distance_str = f"{distance:.1f} km"
-                        
-                        # Determine specialties based on types
-                        specialties = ["Emergency"]
-                        place_types = place.get('types', [])
-                        if 'hospital' in place_types:
-                            specialties.append("General Medicine")
-                        if 'doctor' in place_types:
-                            specialties.append("Medical Care")
-                        
-                        # ✅ FIX: Include GPS coordinates for accurate navigation
-                        hospitals_with_distance.append({
-                            "name": name,
-                            "address": address,
-                            "phone": phone,
-                            "distance": distance_str,
-                            "distance_km": distance,
-                            "lat": place_lat,  # ✅ GPS LATITUDE
-                            "lng": place_lng,  # ✅ GPS LONGITUDE
-                            "specialties": specialties,
-                            "rating": rating
-                        })
-                        
-                except Exception as e:
-                    print(f"⚠️ Error processing hospital: {e}")
+        print(f"🌐 Searching for emergency services near {lat}, {lng} using OpenStreetMap (Overpass API)")
+
+        pois = fetch_osm_pois_around([(lat, lng)], radius_m=5000, max_points=1)
+
+        def closest(places, max_results, max_km, default_phone, default_name):
+            enriched = []
+            for p in places:
+                distance = calculate_distance(lat, lng, p["lat"], p["lng"])
+                if distance > max_km:
                     continue
-            
-            # Sort by distance and take top 5 closest
-            hospitals_with_distance.sort(key=lambda x: x['distance_km'])
-            hospitals = hospitals_with_distance[:5]
-            
-            # Remove distance_km from final output but KEEP lat/lng for navigation
-            for hospital in hospitals:
-                del hospital['distance_km']
-                print(f"✅ Added hospital: {hospital['name']} - {hospital['distance']} - GPS: ({hospital['lat']:.4f}, {hospital['lng']:.4f})")
-                
-        else:
-            print(f"❌ Google Places API HTTP error: {response.status_code}")
-            print(f"Response: {response.text}")
-        
-        # Search for police stations
-        police_stations = []
-        print(f"👮 Searching for police stations within 8km...")
-        
-        police_data = {
-            "includedTypes": ["police"],
-            "maxResultCount": 5,
-            "locationRestriction": {
-                "circle": {
-                    "center": {
-                        "latitude": lat,
-                        "longitude": lng
-                    },
-                    "radius": 3000.0  # Reduced to 3km for closer results
-                }
-            },
-            "rankPreference": "DISTANCE"  # Prioritize closest results
-        }
-        
-        response = requests.post(url, json=police_data, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            places = result.get('places', [])
-            print(f"📊 Google Places API returned {len(places)} police stations")
-            
-            for place in places[:3]:  # Get top 3 police stations
-                try:
-                    name = place.get('displayName', {}).get('text', 'Police Station')
-                    address = place.get('formattedAddress', 'Address not available')
-                    phone = place.get('internationalPhoneNumber', 'Emergency: 100')
-                    
-                    # Calculate distance
-                    place_lat = place.get('location', {}).get('latitude')
-                    place_lng = place.get('location', {}).get('longitude')
-                    
-                    if place_lat and place_lng:
-                        distance = calculate_distance(lat, lng, place_lat, place_lng)
-                        distance_str = f"{distance:.1f} km"
-                        
-                        # ✅ FIX: Include GPS coordinates for accurate navigation
-                        police_stations.append({
-                            "name": name,
-                            "address": address,
-                            "phone": phone,
-                            "distance": distance_str,
-                            "lat": place_lat,  # ✅ GPS LATITUDE
-                            "lng": place_lng,  # ✅ GPS LONGITUDE
-                            "type": "Local Police"
-                        })
-                    else:
-                        # Skip if no GPS coordinates available
-                        continue
-                    
-                    print(f"✅ Added police station: {name} - {distance_str} - GPS: ({place_lat:.4f}, {place_lng:.4f})")
-                    
-                except Exception as e:
-                    print(f"⚠️ Error processing police station: {e}")
-                    continue
-        else:
-            print(f"⚠️ No police stations found or API error")
-        
-        # Search for gas stations (as mechanics alternative)
-        mechanics = []
-        print(f"⛽ Searching for gas stations within 8km...")
-        
-        gas_data = {
-            "includedTypes": ["gas_station"],
-            "maxResultCount": 5,
-            "locationRestriction": {
-                "circle": {
-                    "center": {
-                        "latitude": lat,
-                        "longitude": lng
-                    },
-                    "radius": 3000.0  # Reduced to 3km for closer results
-                }
-            },
-            "rankPreference": "DISTANCE"  # Prioritize closest results
-        }
-        
-        response = requests.post(url, json=gas_data, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            places = result.get('places', [])
-            print(f"📊 Google Places API returned {len(places)} gas stations")
-            
-            for place in places[:3]:  # Get top 3 gas stations
-                try:
-                    name = place.get('displayName', {}).get('text', 'Gas Station')
-                    address = place.get('formattedAddress', 'Address not available')
-                    phone = place.get('internationalPhoneNumber', 'Roadside: 1073')
-                    
-                    # Calculate distance
-                    place_lat = place.get('location', {}).get('latitude')
-                    place_lng = place.get('location', {}).get('longitude')
-                    
-                    if place_lat and place_lng:
-                        distance = calculate_distance(lat, lng, place_lat, place_lng)
-                        distance_str = f"{distance:.1f} km"
-                        
-                        # ✅ FIX: Include GPS coordinates for accurate navigation
-                        mechanics.append({
-                            "name": name,
-                            "address": address,
-                            "phone": phone,
-                            "distance": distance_str,
-                            "lat": place_lat,  # ✅ GPS LATITUDE
-                            "lng": place_lng,  # ✅ GPS LONGITUDE
-                            "services": ["Fuel", "Basic Repairs", "Emergency Service"]
-                        })
-                    else:
-                        # Skip if no GPS coordinates available
-                        continue
-                    
-                    print(f"✅ Added gas station: {name} - {distance_str} - GPS: ({place_lat:.4f}, {place_lng:.4f})")
-                    
-                except Exception as e:
-                    print(f"⚠️ Error processing gas station: {e}")
-                    continue
-        else:
-            print(f"⚠️ No gas stations found or API error")
-        
-        # Search for lodging (hotels)
-        hotels = []
-        print(f"🏨 Searching for hotels within 8km...")
-        
-        hotel_data = {
-            "includedTypes": ["lodging"],
-            "maxResultCount": 5,
-            "locationRestriction": {
-                "circle": {
-                    "center": {
-                        "latitude": lat,
-                        "longitude": lng
-                    },
-                    "radius": 3000.0  # Reduced to 3km for closer results
-                }
-            },
-            "rankPreference": "DISTANCE"  # Prioritize closest results
-        }
-        
-        response = requests.post(url, json=hotel_data, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            places = result.get('places', [])
-            print(f"📊 Google Places API returned {len(places)} hotels")
-            
-            for place in places[:3]:  # Get top 3 hotels
-                try:
-                    name = place.get('displayName', {}).get('text', 'Hotel')
-                    address = place.get('formattedAddress', 'Address not available')
-                    phone = place.get('internationalPhoneNumber', 'Emergency: 112')
-                    
-                    # Calculate distance
-                    place_lat = place.get('location', {}).get('latitude')
-                    place_lng = place.get('location', {}).get('longitude')
-                    
-                    if place_lat and place_lng:
-                        distance = calculate_distance(lat, lng, place_lat, place_lng)
-                        distance_str = f"{distance:.1f} km"
-                        
-                        # ✅ FIX: Include GPS coordinates for accurate navigation
-                        hotels.append({
-                            "name": name,
-                            "address": address,
-                            "phone": phone,
-                            "distance": distance_str,
-                            "lat": place_lat,  # ✅ GPS LATITUDE
-                            "lng": place_lng,  # ✅ GPS LONGITUDE
-                            "amenities": ["Safe Space", "Reception", "Restrooms", "Security"]
-                        })
-                    else:
-                        # Skip if no GPS coordinates available
-                        continue
-                    
-                    print(f"✅ Added hotel: {name} - {distance_str} - GPS: ({place_lat:.4f}, {place_lng:.4f})")
-                    
-                except Exception as e:
-                    print(f"⚠️ Error processing hotel: {e}")
-                    continue
-        else:
-            print(f"⚠️ No hotels found or API error")
-        
+                enriched.append({
+                    "name": p["name"] or default_name,
+                    "address": p["address"] or "Address not available",
+                    "phone": p["phone"] or default_phone,
+                    "distance": f"{distance:.1f} km",
+                    "lat": p["lat"],
+                    "lng": p["lng"],
+                    "_distance_km": distance
+                })
+            enriched.sort(key=lambda x: x["_distance_km"])
+            for p in enriched:
+                del p["_distance_km"]
+            return enriched[:max_results]
+
+        # Same radii and result caps as the previous implementation
+        hospitals       = closest(pois.get("hospital", []),    5, 5.0, "Emergency: 112", "Unknown Hospital")
+        police_stations = closest(pois.get("police", []),      3, 3.0, "Emergency: 100", "Police Station")
+        mechanics       = closest(pois.get("gas_station", []), 3, 3.0, "Roadside: 1073", "Gas Station")
+        hotels          = closest(pois.get("lodging", []),     3, 3.0, "Emergency: 112", "Hotel")
+
         # Return the real places data if we found at least some services
         if hospitals or police_stations or mechanics or hotels:
-            print(f"✅ Google Places API found: {len(hospitals)} hospitals, {len(police_stations)} police, {len(mechanics)} mechanics, {len(hotels)} safe places")
+            print(f"✅ OpenStreetMap found: {len(hospitals)} hospitals, {len(police_stations)} police, {len(mechanics)} mechanics, {len(hotels)} safe places")
             return {
-                "hospitals": hospitals,
-                "police_stations": police_stations,
-                "mechanics": mechanics,
-                "hotels_restrooms": hotels,
+                "hospitals": [
+                    {**h, "specialties": ["Emergency", "General Medicine"]} for h in hospitals
+                ],
+                "police_stations": [
+                    {**p, "type": "Local Police"} for p in police_stations
+                ],
+                "mechanics": [
+                    {**m, "services": ["Fuel", "Basic Repairs", "Emergency Service"]} for m in mechanics
+                ],
+                "hotels_restrooms": [
+                    {**h, "amenities": ["Safe Space", "Reception", "Restrooms", "Security"]} for h in hotels
+                ],
                 "emergency_tips": [
                     "Stay calm and move to a well-lit, populated area immediately",
                     "Call 100 for police, 102 for ambulance, or 112 for general emergency",
@@ -832,12 +710,12 @@ def get_nearby_places_with_google_api(lat, lng):
                     "Trust your instinsts - if something feels wrong, seek help immediately"
                 ]
             }
-        else:
-            print(f"⚠️ Google Places API found no emergency services")
-            return None
-            
+
+        print(f"⚠️ OpenStreetMap found no emergency services near {lat}, {lng}")
+        return None
+
     except Exception as e:
-        print(f"❌ Error fetching places from Google API: {e}")
+        print(f"❌ Error fetching places from OpenStreetMap: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -940,15 +818,15 @@ Respond ONLY with valid JSON (no markdown, no explanation):
 def get_fallback_emergency_suggestions(lat, lng):
     """
     Enhanced fallback with proper priority:
-    1. Try Google Places API (New) FIRST
+    1. Try the OpenStreetMap Overpass API FIRST
     2. If that fails, use generic suggestions
     """
     print(f"🔄 Using fallback emergency suggestions for {lat}, {lng}")
     
-    # Try Google Places API (New)
-    print(f"🌐 Attempting Google Places API (New)...")
+    # Try OpenStreetMap (Overpass API)
+    print(f"🌐 Attempting OpenStreetMap Overpass API...")
     try:
-        places_suggestions = get_nearby_places_with_google_api(lat, lng)
+        places_suggestions = get_nearby_places_with_osm(lat, lng)
         
         # Check if we got real data
         if places_suggestions:
@@ -958,19 +836,19 @@ def get_fallback_emergency_suggestions(lat, lng):
                        (places_suggestions.get('hotels_restrooms') and len(places_suggestions.get('hotels_restrooms', [])) > 0))
             
             if has_data:
-                print(f"✅ Google Places API Success!")
+                print(f"✅ OpenStreetMap Overpass API Success!")
                 print(f"   📊 Hospitals: {len(places_suggestions.get('hospitals', []))}")
                 print(f"   📊 Police: {len(places_suggestions.get('police_stations', []))}")
                 print(f"   📊 Mechanics: {len(places_suggestions.get('mechanics', []))}")
                 print(f"   📊 Safe Places: {len(places_suggestions.get('hotels_restrooms', []))}")
                 return places_suggestions
             else:
-                print(f"⚠️ Google Places API returned empty results")
+                print(f"⚠️ OpenStreetMap Overpass API returned empty results")
         else:
-            print(f"⚠️ Google Places API returned None")
+            print(f"⚠️ OpenStreetMap Overpass API returned None")
             
     except Exception as e:
-        print(f"⚠️ Google Places API failed: {e}")
+        print(f"⚠️ OpenStreetMap Overpass API failed: {e}")
         traceback.print_exc()
     
     # Generic fallback as last resort
@@ -1115,29 +993,29 @@ def send_alert():
         print(f"   Database: ✅ Saved")
         print(f"   Broadcasting to: 'admin' room")
         
-        # 🚀 PRIORITY: Use Google Places API (New) for REAL emergency services data
-        # 1. Google Places API (New) - Real locations, addresses, phone numbers (PRIMARY)
+        # 🚀 PRIORITY: Use OpenStreetMap (Overpass) for REAL emergency services data
+        # 1. OpenStreetMap Overpass API - Real locations, addresses, phone numbers (PRIMARY)
         # 2. Groq AI - AI-generated suggestions (BACKUP)
         # 3. Generic fallback - Last resort
         
-        print(f"🌐 Using Google Places API (New) for real emergency services...")
-        emergency_suggestions = get_nearby_places_with_google_api(lat, lng)
+        print(f"🌐 Using OpenStreetMap Overpass API for real emergency services...")
+        emergency_suggestions = get_nearby_places_with_osm(lat, lng)
         
-        # Check if Google Places provided good results
+        # Check if OpenStreetMap provided good results
         if emergency_suggestions and any(len(emergency_suggestions.get(key, [])) > 0 for key in ['hospitals', 'police_stations', 'mechanics', 'hotels_restrooms']):
-            print(f"✅ Google Places API provided real emergency services")
+            print(f"✅ OpenStreetMap provided real emergency services")
             print(f"   📊 Hospitals: {len(emergency_suggestions.get('hospitals', []))}")
             print(f"   📊 Police: {len(emergency_suggestions.get('police_stations', []))}")
             print(f"   📊 Mechanics: {len(emergency_suggestions.get('mechanics', []))}")
             print(f"   📊 Safe Places: {len(emergency_suggestions.get('hotels_restrooms', []))}")
         else:
-            # If Google Places fails, try Groq AI as backup
-            print(f"⚠️ Google Places API failed or returned no data, trying Groq AI backup...")
+            # If OpenStreetMap fails, try Groq AI as backup
+            print(f"⚠️ OpenStreetMap failed or returned no data, trying Groq AI backup...")
             emergency_suggestions = get_emergency_suggestions_with_groq(lat, lng)
             
             # If both fail, use generic fallback
             if not emergency_suggestions or not any(len(emergency_suggestions.get(key, [])) > 0 for key in ['hospitals', 'police_stations', 'mechanics', 'hotels_restrooms']):
-                print(f"⚠️ Both Google Places and Groq AI failed, using generic fallback...")
+                print(f"⚠️ Both OpenStreetMap and Groq AI failed, using generic fallback...")
                 emergency_suggestions = get_fallback_emergency_suggestions(lat, lng)
         
         print(f"✅ Emergency suggestions generated")
@@ -1227,7 +1105,9 @@ def update_alert(alert_id):
 
 @app.route("/get-maps-config", methods=["GET"])
 def get_maps_config():
-    """Serve Google Maps API key securely to frontend"""
+    """DEPRECATED legacy endpoint that served the Google Maps API key to the
+    frontend. Maps now run on free OpenStreetMap/Leaflet (no key), so the current
+    frontend never calls this. Kept only so older cached pages keep working."""
     return jsonify({
         "google_maps_api_key": API_KEY,
         "status": "success"
@@ -1259,39 +1139,34 @@ def get_routes():
             print(f"✅ Using {len(frontend_routes)} routes provided by frontend (index-safe)")
             raw_routes = frontend_routes  # list of {index, polyline, distance_text, distance_meters, duration_text, duration_seconds, summary}
         else:
-            print(f"⚠️ No frontend routes provided, falling back to Directions API call")
-            directions_url = "https://maps.googleapis.com/maps/api/directions/json"
-            params = {"origin": source, "destination": destination, "alternatives": "true", "key": API_KEY}
-            response = requests.get(directions_url, params=params, timeout=15).json()
-            print(f"   Status: {response.get('status')}, Routes: {len(response.get('routes', []))}")
-            if response.get("status") != "OK":
-                return jsonify({"error": f"Directions failed: {response.get('status')}"}), 400
-            raw_routes = [
-                {
-                    "index": i,
-                    "polyline": r["overview_polyline"]["points"],
-                    "distance_text": r["legs"][0]["distance"]["text"],
-                    "distance_meters": r["legs"][0]["distance"]["value"],
-                    "duration_text": r["legs"][0]["duration"]["text"],
-                    "duration_seconds": r["legs"][0]["duration"]["value"],
-                    "summary": r.get("summary", "")
-                }
-                for i, r in enumerate(response.get("routes", []))
-            ]
+            print(f"⚠️ No frontend routes provided, falling back to OSRM route planning")
+            raw_routes = _osrm_plan_routes(source, destination)
+            if not raw_routes:
+                return jsonify({"error": "Directions failed: could not geocode locations or no road route found"}), 400
+            print(f"   OSRM routes: {len(raw_routes)}")
 
         print(f"📊 Processing {len(raw_routes)} routes")
 
+        # Decode all routes once, then fetch POI candidates for ALL of them with a
+        # single Overpass query (one HTTP round-trip instead of one per type/route)
+        routes_points_list = [polyline.decode(rr["polyline"]) for rr in raw_routes]
+        try:
+            prefetched_pois = prefetch_route_pois(routes_points_list)
+        except Exception as e:
+            print(f"⚠️ POI prefetch failed: {e}")
+            traceback.print_exc()
+            prefetched_pois = {k: [] for k in OSM_POI_TAG_FILTERS}
+
         routes_data = []
-        for rr in raw_routes:
+        for rr, route_points in zip(raw_routes, routes_points_list):
             route_idx    = rr["index"]
             polyline_str = rr["polyline"]
-            route_points = polyline.decode(polyline_str)
             distance_km  = rr["distance_meters"] / 1000
             area_type    = "Main Road" if "highway" in rr.get("summary", "").lower() else "Urban"
 
             print(f"🔍 Route {route_idx + 1}: Finding services along {len(route_points)} points...")
             try:
-                amenities, locations = get_safety_counts(route_points)
+                amenities, locations = get_safety_counts(route_points, prefetched_pois)
             except Exception as e:
                 print(f"⚠️ Safety counts failed for route {route_idx + 1}: {e}")
                 amenities = {"hospitals": 0, "police": 0}
@@ -1328,7 +1203,7 @@ def get_routes():
             }
             routes_data.append(route_data)
         
-        print(f"✅ Processed {len(routes_data)} real routes from Google")
+        print(f"✅ Processed {len(routes_data)} real routes")
         
         # ✅ Generate additional synthetic routes if we have less than 3
         if len(routes_data) < 3:
@@ -2025,14 +1900,17 @@ def clear_all_data():
 
 @app.route("/ai-status", methods=["GET"])
 def ai_status():
-    """Check current AI configuration status (Groq + Google Places)"""
+    """Check current AI configuration status (Groq + OpenStreetMap services)"""
     try:
         status_info = {
             "groq_available": GROQ_AVAILABLE,
             "groq_configured": groq_client is not None,
             "groq_api_key_configured": bool(GROQ_API_KEY),
-            "google_places_available": bool(API_KEY),
-            "primary_ai": "Google Places API (New)" if API_KEY else "Groq" if groq_client else "Generic Fallback"
+            "poi_provider": "OpenStreetMap (Overpass API)",
+            "routing_provider": "OSRM (Open Source Routing Machine)",
+            "geocoding_provider": "Nominatim (OpenStreetMap)",
+            "maps_api_key_required": False,
+            "primary_ai": "OpenStreetMap (Overpass API)"
         }
         
         # Test Groq if available
@@ -2094,7 +1972,8 @@ def handle_disconnect():
 if __name__ == "__main__":
     print("🛡️ SafeRoute Backend Starting...")
     print("🚨 SOS Alert System: Active")
-    print("🌐 Google Places API (New): Primary Emergency Service Provider")
+    print("🌍 OpenStreetMap Overpass API: Primary Emergency Service Provider")
+    print("🗺️ OSRM: Route Planning | Nominatim: Geocoding (free & keyless)")
     print("🤖 Groq AI: Backup Emergency Assistant")
     
     # Get port from environment variable (Render uses PORT env var)

@@ -46,14 +46,14 @@ safeRoute-AI/
 | Flask-SocketIO + Eventlet | Real-time WebSocket communication |
 | SQLite3 | Persistent storage for alerts and reports |
 | Groq AI (llama-3.3-70b-versatile) | AI explanations, narration, forecasting |
-| Google Directions API v2 | Route planning and polyline encoding |
-| Google Places API | Finding real hospitals, police stations, POIs |
+| OSRM (Open Source Routing Machine) | Route planning and polyline encoding (free, keyless) |
+| Overpass API (OpenStreetMap) | Finding real hospitals, police stations, POIs |
 
 ### Frontend
 | Technology | Purpose |
 |---|---|
 | Vanilla JavaScript | No-framework approach, lightweight |
-| Google Maps JavaScript API v3 | Interactive map, HeatmapLayer, DirectionsRenderer |
+| Leaflet (OpenStreetMap) | Interactive map, leaflet.heat heatmap, route polylines |
 | Socket.IO Client 4.7.5 | Real-time SOS and report broadcasting |
 | Web Speech Synthesis API | Browser-native text-to-speech narration |
 | FontAwesome 6.4.0 | UI icons |
@@ -94,7 +94,7 @@ safeRoute-AI/
 - Optional Groq AI narrative insight about time-based risk patterns
 
 ### 5. Danger Heatmap
-- Toggle-able crime heatmap overlay using Google Maps `HeatmapLayer`
+- Toggle-able crime heatmap overlay using the `leaflet.heat` plugin
 - Intensity color scale: Yellow → Orange → Red → Deep Red
 - Populated from community reports and SOS alert locations
 - Auto-refreshes when new reports are submitted
@@ -104,7 +104,7 @@ safeRoute-AI/
 - On confirmation:
   - Saves alert to database with GPS coordinates and user name
   - Broadcasts to admin dashboard in real-time via Socket.IO
-  - Calls Google Places API + Groq AI to suggest nearby hospitals, police stations, and hotels
+  - Calls OpenStreetMap (Overpass) + Groq AI to suggest nearby hospitals, police stations, and hotels
   - Falls back to generic emergency numbers if APIs fail
 
 ### 7. Community Safety Reports
@@ -133,7 +133,7 @@ safeRoute-AI/
 | POST | `/post-feedback` | Submit a community incident report |
 | GET | `/get-feedback` | Retrieve all community reports |
 | POST | `/clear-all-data` | Admin: wipe all alerts and feedback |
-| GET | `/get-maps-config` | Secure Google Maps API key delivery to frontend |
+| GET | `/get-maps-config` | **DEPRECATED** legacy Google Maps key shim (maps are now keyless OSM) |
 
 ---
 
@@ -173,7 +173,7 @@ The system uses a layered fallback chain to ensure reliability:
 
 ```
 1. Groq AI (llama-3.3-70b-versatile)     ← Primary: fast, intelligent
-2. Google Places API                      ← Real location data
+2. OpenStreetMap Overpass API             ← Real location data
 3. Client-side calculation                ← Offline safety score estimation
 4. Hardcoded helpline numbers             ← Final fallback (always available)
 ```
@@ -201,7 +201,7 @@ For route narration specifically:
 ## Security
 
 - API keys stored in `.env`, never hardcoded or committed
-- Google Maps API key served securely from backend (not exposed in frontend source)
+- No maps API key needed at all — free OpenStreetMap services (the deprecated `/get-maps-config` Google-key shim remains for old cached pages)
 - SQL injection prevention via parameterized queries
 - CORS configured for allowed origins only
 - SOS confirmation countdown prevents accidental emergency broadcasts
@@ -257,29 +257,41 @@ Incidents are synthetically scattered within 50–300m of route points for demon
 ## Environment Variables
 
 ```env
-GROQ_API_KEY=your_groq_api_key_here
-GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
-PORT=5000
-FLASK_ENV=development
-BACKEND_URL=http://localhost:5000
-FRONTEND_URL=http://localhost:8000
+GROQ_API_KEY=your_groq_api_key_here   # optional — AI features only
+# GOOGLE_MAPS_API_KEY is no longer required (legacy, kept for the deprecated
+# /get-maps-config endpoint only)
+PORT=5000                             # backend port (Render sets this automatically)
 ```
 
 ---
 
 ## Running Locally
 
-```bash
-# Backend
-cd backend
-pip install -r requirements.txt
-python app.py
+No maps API keys needed — routing, geocoding and POI search use free OpenStreetMap services.
 
-# Frontend — serve with any static server
-cd frontend
-python -m http.server 8000
-# Open http://localhost:8000
+```bash
+# 1) Install dependencies (from the repo root — requirements.txt lives there)
+python -m venv venv
+source venv/bin/activate             # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+# 2) Backend — Flask + Socket.IO API on port 5000
+python backend/app.py
+
+# 3) Frontend — in a SECOND terminal, serve the static files on port 8000
+python -m http.server 8000 --directory frontend
 ```
+
+Then open:
+- Landing page → http://localhost:8000
+- Main app → http://localhost:8000/app.html
+- Admin dashboard → http://localhost:8000/admin.html
+
+> Open the app via `http://localhost:8000` — not by double-clicking the HTML
+> files. `frontend/config.js` auto-detects the environment: `localhost` /
+> `127.0.0.1` hostnames use the local backend (`http://localhost:5000`), any
+> other hostname uses the deployed backend
+> (`https://saferoute-backend-4b81.onrender.com`).
 
 ---
 
