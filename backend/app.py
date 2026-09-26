@@ -56,13 +56,13 @@ def after_request(response):
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Load API keys from environment variables
-# NOTE: SafeRoute now uses free, keyless OpenStreetMap services (Overpass API for
+# NOTE: VigiPath now uses free, keyless OpenStreetMap services (Overpass API for
 # POIs, OSRM for routing, Nominatim for geocoding) and no longer requires a Google
 # Maps API key. The key below is kept ONLY for the deprecated /get-maps-config
 # endpoint so older cached frontends keep working until they reload.
 API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
 if not API_KEY:
-    print("ℹ️ GOOGLE_MAPS_API_KEY not set (not required — SafeRoute uses free OpenStreetMap services).")
+    print("ℹ️ GOOGLE_MAPS_API_KEY not set (not required — VigiPath uses free OpenStreetMap services).")
 
 # --- Free & keyless map services (replaced Google Maps Platform) ---
 OSRM_BASE_URL = "https://router.project-osrm.org"
@@ -71,7 +71,7 @@ OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",   # mirror fallback
 ]
-HTTP_USER_AGENT = "SafeRoute/1.0 (OpenStreetMap-based safety navigation, hackathon project)"
+HTTP_USER_AGENT = "VigiPath/1.0 (OpenStreetMap-based safety navigation, hackathon project)"
 
 # Internal POI type keys -> OpenStreetMap tag filters
 OSM_POI_TAG_FILTERS = {
@@ -1036,9 +1036,11 @@ def get_fallback_emergency_suggestions(lat, lng):
         ]
     }
 
+DB_NAME = 'vigipath.db' if os.path.exists('vigipath.db') else ('saferoute.db' if os.path.exists('saferoute.db') else 'vigipath.db')
+
 # Database Initialization
 def init_db():
-    conn = sqlite3.connect('saferoute.db')
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
    
     # Create SOS alerts table with user_name column
@@ -1100,7 +1102,7 @@ def send_alert():
         # Get current timestamp
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
        
-        conn = sqlite3.connect('saferoute.db')
+        conn = sqlite3.connect(DB_NAME)
         try:
             c = conn.cursor()
             c.execute("INSERT INTO sos_alerts (lat, lng, timestamp, status, user_name) VALUES (?, ?, ?, 'PENDING', ?)",
@@ -1178,7 +1180,7 @@ def send_alert():
 def get_all_alerts():
     try:
         status_filter = request.args.get('status', None)
-        conn = sqlite3.connect('saferoute.db')
+        conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
        
         if status_filter:
@@ -1211,7 +1213,7 @@ def update_alert(alert_id):
     try:
         data = request.json or {}
         status = data.get('status', 'RESOLVED')
-        conn = sqlite3.connect('saferoute.db')
+        conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
         c.execute("UPDATE sos_alerts SET status = ? WHERE id = ?", (status, alert_id))
         if c.rowcount == 0:
@@ -1563,7 +1565,7 @@ def explain_route():
             incident_summary[t] = incident_summary.get(t, 0) + 1
         incident_text = ", ".join([f"{v} {k}" for k, v in incident_summary.items()]) or "none reported"
 
-        prompt = f"""You are SafeRoute AI, a personal safety assistant. Explain in 3-4 short, friendly sentences why Route {route_index + 1} has a safety score of {safety_score}/100.
+        prompt = f"""You are VigiPath AI, a personal safety assistant. Explain in 3-4 short, friendly sentences why Route {route_index + 1} has a safety score of {safety_score}/100.
 
 Route data:
 - Safety Score: {safety_score}/100
@@ -1585,7 +1587,7 @@ Rules:
 
         explanation = call_groq(
             prompt,
-            system_prompt="You are SafeRoute AI, a safety navigation assistant. Give clear, concise route safety explanations in plain text.",
+            system_prompt="You are VigiPath AI, a safety navigation assistant. Give clear, concise route safety explanations in plain text.",
             max_tokens=200,
             temperature=0.4
         )
@@ -1741,7 +1743,7 @@ def narrate_route():
         incident_summary = ", ".join([f"{v} {k} report{'s' if v > 1 else ''}"
                                       for k, v in incident_types.items()]) or "no reported incidents"
 
-        prompt = f"""You are SafeRoute AI, a personal safety navigator. Generate a spoken route briefing for Route {route_num}.
+        prompt = f"""You are VigiPath AI, a personal safety navigator. Generate a spoken route briefing for Route {route_num}.
 
 Route data:
 - Safety score: {safety_score} out of 100
@@ -1766,7 +1768,7 @@ Write a natural, spoken 4-5 sentence safety briefing. Rules:
 
         narration = call_groq(
             prompt,
-            system_prompt="You are SafeRoute AI, a calm and confident safety navigation assistant. Speak naturally as if talking to a friend.",
+            system_prompt="You are VigiPath AI, a calm and confident safety navigation assistant. Speak naturally as if talking to a friend.",
             max_tokens=250,
             temperature=0.5
         )
@@ -1832,7 +1834,7 @@ def post_feedback():
         # Get current timestamp
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
        
-        conn = sqlite3.connect('saferoute.db')
+        conn = sqlite3.connect(DB_NAME)
         try:
             c = conn.cursor()
             c.execute("INSERT INTO route_feedback (lat, lng, type, description, route_polyline, timestamp, user_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1879,7 +1881,7 @@ def get_feedback():
         lng = request.args.get('lng', type=float)
         radius = request.args.get('radius', 5000, type=int)
        
-        conn = sqlite3.connect('saferoute.db')
+        conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
         c.execute("SELECT id, lat, lng, type, description, timestamp, user_name FROM route_feedback ORDER BY timestamp DESC LIMIT 100")
         rows = c.fetchall()
@@ -1929,7 +1931,7 @@ def clear_all_data():
             return jsonify({"error": "Confirmation token required"}), 400
         
         # Connect to database
-        conn = sqlite3.connect('saferoute.db')
+        conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
         
         # Get counts before deletion
@@ -2071,7 +2073,7 @@ def ai_status():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "service": "SafeRoute API", "timestamp": datetime.now().isoformat()})
+    return jsonify({"status": "healthy", "service": "VigiPath API", "timestamp": datetime.now().isoformat()})
 
 # SocketIO Events
 @socketio.on('connect')
@@ -2079,9 +2081,9 @@ def handle_connect():
     print(f"\n{'🟢'*20}")
     print(f"📌 NEW CLIENT CONNECTED")
     print(f"   Client ID: {request.sid}")
-    print(f"   Status: ✅ Connected to SafeRoute server")
+    print(f"   Status: ✅ Connected to VigiPath server")
     print(f"{'🟢'*20}\n")
-    emit('status', {'msg': 'Connected to SafeRoute server'})
+    emit('status', {'msg': 'Connected to VigiPath server'})
 
 @socketio.on('join_admin')
 def handle_join_admin():
@@ -2103,7 +2105,7 @@ def handle_disconnect():
     print(f"{'🔴'*20}\n")
 
 if __name__ == "__main__":
-    print("🛡️ SafeRoute Backend Starting...")
+    print("🛡️ VigiPath Backend Starting...")
     print("🚨 SOS Alert System: Active")
     print("🌍 OpenStreetMap Overpass API: Primary Emergency Service Provider")
     print("🗺️ OSRM: Route Planning | Nominatim: Geocoding (free & keyless)")

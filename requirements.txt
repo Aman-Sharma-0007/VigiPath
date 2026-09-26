@@ -1,4 +1,4 @@
-# SafeRoute AI - Python Dependencies
+# VigiPath AI - Python Dependencies
 # Install with: pip install -r requirements.txt
 
 # Python 3.12+ Compatibility

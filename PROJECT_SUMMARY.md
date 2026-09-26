@@ -1,4 +1,4 @@
-# SafeRoute-AI — Project Summary
+# VigiPath — Project Summary
 
 > An AI-powered intelligent navigation system that prioritizes user safety by analyzing crime data, emergency services, and community reports to recommend the safest routes.
 
@@ -6,7 +6,7 @@
 
 ## Overview
 
-SafeRoute is a hackathon project focused on women's safety and community-driven protection. It generates safety-scored route alternatives using real-time data, AI reasoning, and crowd-sourced incident reports — all visualized on an interactive map.
+VigiPath is a hackathon project focused on women's safety and community-driven protection. It generates safety-scored route alternatives using real-time data, AI reasoning, and crowd-sourced incident reports — all visualized on an interactive map.
 
 **Live Deployment:**
 - User App: `https://saferoute-frontend.onrender.com/`
