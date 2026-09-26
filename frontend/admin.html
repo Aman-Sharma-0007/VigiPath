@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>SafeRoute Admin</title>
+    <title>VigiPath Admin</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
@@ -62,7 +62,7 @@
     <div class="admin-container">
         <div class="header">
             <div class="logo">
-                <i class="fa-solid fa-shield-halved"></i> SafeRoute Admin
+                <i class="fa-solid fa-shield-halved" style="color:var(--accent);"></i> VigiPath Admin
             </div>
             <div><span class="status-dot"></span> Online</div>
         </div>
@@ -119,7 +119,7 @@
             console.log('🔌 Admin: Disconnected from Server'); 
         });
         socket.on('connect_error', (error) => { 
-            console.error('❌ Admin: Socket connection error:', error); 
+            console.warn('⚠️ Admin: Socket connection error:', error); 
         });
         socket.on('new_sos_alert', () => { 
             console.log('🚨 Admin: New SOS alert received');
@@ -149,6 +149,7 @@
         async function loadAlerts() {
             try {
                 const res = await fetch(`${window.BACKEND_URL}/get-all-alerts`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const alerts = await res.json();
                 
                 document.getElementById('stat-sos').innerText = alerts.filter(a => a.status === 'PENDING').length;
@@ -182,12 +183,13 @@
                         </div>
                     </li>
                 `).join('');
-            } catch(e) { console.error(e); }
+            } catch(e) { console.warn('Alerts fetch error:', e); }
         }
 
         async function loadFeedback() {
             try {
                 const res = await fetch(`${window.BACKEND_URL}/get-feedback`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const reports = await res.json();
                 document.getElementById('stat-reports').innerText = reports.length;
 
@@ -217,14 +219,18 @@
                         </div>
                     </li>
                 `).join('');
-            } catch(e) {}
+            } catch(e) { console.warn('Feedback fetch error:', e); }
         }
 
         async function resolveAlert(id) {
-            await fetch(`${window.BACKEND_URL}/update-alert/${id}`, {
-                method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({status: 'RESOLVED'})
-            });
-            loadAlerts();
+            try {
+                await fetch(`${window.BACKEND_URL}/update-alert/${id}`, {
+                    method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({status: 'RESOLVED'})
+                });
+                loadAlerts();
+            } catch (err) {
+                console.warn('Resolve error:', err);
+            }
         }
 
         async function clearAllData() {
@@ -233,38 +239,20 @@
             if (confirmed) {
                 try {
                     console.log('🗑️ Admin: Clearing all data...');
-                    console.log('📡 Sending POST to /clear-all-data endpoint');
-                    
                     const response = await fetch(`${window.BACKEND_URL}/clear-all-data`, {
                         method: 'POST', 
                         headers: {'Content-Type': 'application/json'}, 
                         body: JSON.stringify({confirmation: 'DELETE_ALL_DATA'})
                     });
                     
-                    console.log('📨 Response status:', response.status);
-                    console.log('📨 Response ok:', response.ok);
-                    
                     if (response.ok) {
                         const result = await response.json();
-                        console.log('✅ Admin: Data cleared successfully:', result);
-                        
-                        // Immediately refresh the admin panels (don't wait for socket)
                         loadAlerts();
                         loadFeedback();
-                        
-                        alert(`Data cleared: ${result.sos_deleted} alerts & ${result.feedback_deleted} reports deleted`);
-                        
-                        console.log('✅ Admin UI refreshed');
-                        
-                    } else {
-                        const error = await response.json();
-                        console.error('❌ Admin: Clear data failed:', error);
-                        alert(`❌ Failed to clear data: ${error.error || 'Unknown error'}`);
+                        console.log(`✅ Data cleared: ${result.sos_deleted} alerts & ${result.feedback_deleted} reports deleted`);
                     }
-                    
                 } catch (error) {
-                    console.error('❌ Admin: Clear data error:', error);
-                    alert(`❌ Error clearing data: ${error.message}\\n\\nPlease check if the backend server is running.`);
+                    console.warn('Admin clear data error:', error);
                 }
             }
         }

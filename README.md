@@ -1,14 +1,14 @@
-# 🛡️ SafeRoute - AI-Powered Safety Navigation
+# 🛡️ VigiPath - AI-Powered Safety Navigation
 
 > **Hackathon Project**: Empowering safer journeys through AI-driven route analysis and real-time community alerts.
 
 ## 🚀 Live Demo
 
-**Try SafeRoute now - No installation required!**
+**Try VigiPath now - No installation required!**
 
 | 🌐 **User App** | 👨‍💼 **Admin Dashboard** |
 |:---:|:---:|
-| [![Launch App](https://img.shields.io/badge/🚀_Launch_SafeRoute-4CAF50?style=for-the-badge&logo=googlemaps&logoColor=white)](https://saferoute-frontend.onrender.com/) | [![Admin Panel](https://img.shields.io/badge/👨‍💼_Admin_Panel-FF5722?style=for-the-badge&logo=dashboard&logoColor=white)](https://saferoute-frontend.onrender.com/admin) |
+| [![Launch App](https://img.shields.io/badge/🚀_Launch_VigiPath-4CAF50?style=for-the-badge&logo=googlemaps&logoColor=white)](https://saferoute-frontend.onrender.com/) | [![Admin Panel](https://img.shields.io/badge/👨‍💼_Admin_Panel-FF5722?style=for-the-badge&logo=dashboard&logoColor=white)](https://saferoute-frontend.onrender.com/admin) |
 | Main navigation interface | Monitor SOS alerts & community reports |
 
 **🔗 Direct Links:**
@@ -17,7 +17,7 @@
 
 ---
 
-SafeRoute is an intelligent navigation system that prioritizes user safety by analyzing crime data, emergency services availability, and community reports to recommend the safest routes. Built during a hackathon with a focus on women's safety and community-driven protection.
+VigiPath is an intelligent navigation system that prioritizes user safety by analyzing crime data, emergency services availability, and community reports to recommend the safest routes. Built during a hackathon with a focus on women's safety and community-driven protection.
 
 ## 🌟 Features
 
@@ -419,4 +419,4 @@ This project is open source and available under the [MIT License](LICENSE).
 
 **⚠️ Disclaimer**: This is a hackathon prototype. While functional, it should not be used as the sole source for emergency situations. Always contact local emergency services directly in case of real emergencies.
 
-**🛡️ SafeRoute - Because every journey should be a safe journey.**
+**🛡️ VigiPath - Because every journey should be a safe journey.**
