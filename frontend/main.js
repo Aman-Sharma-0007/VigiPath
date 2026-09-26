@@ -12,6 +12,8 @@ const socket = io(window.BACKEND_URL);
 const OSRM_BASE_URL = 'https://router.project-osrm.org';
 // Nominatim — OpenStreetMap geocoding / reverse geocoding, no API key
 const NOMINATIM_BASE_URL = 'https://nominatim.openstreetmap.org';
+// Photon — OpenStreetMap-powered autocomplete service (by Komoot), no API key
+const PHOTON_BASE_URL = 'https://photon.komoot.io/api';
 
 // Session cache for geocoded locations (respects Nominatim's fair-use policy)
 const geocodeCache = new Map();
@@ -88,6 +90,123 @@ async function reverseGeocodeLocation(lat, lng) {
   }
 }
 
+
+/* --- Location autocomplete while typing (Photon / OpenStreetMap) --- */
+const selectedLocationCoords = {}; // input id -> {lat, lng, label} picked from suggestions
+
+function getSelectedCoords(inputId, currentValue) {
+  const sel = selectedLocationCoords[inputId];
+  if (sel && sel.label === (currentValue || '').trim()) return { lat: sel.lat, lng: sel.lng };
+  return null;
+}
+
+function formatPhotonLabel(p) {
+  const parts = [p.name, p.street, p.city || p.district || p.county, p.state, p.country].filter(Boolean);
+  return [...new Set(parts)].slice(0, 4).join(', ');
+}
+
+async function fetchLocationSuggestions(query) {
+  const params = new URLSearchParams({ q: query, limit: '6', lang: 'en' });
+  if (map) { // bias results toward the current map view
+    const c = map.getCenter();
+    params.set('lat', c.lat.toFixed(5));
+    params.set('lon', c.lng.toFixed(5));
+  }
+  const response = await fetch(`${PHOTON_BASE_URL}?${params.toString()}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  return (data.features || []).map(f => ({
+    label: formatPhotonLabel(f.properties || {}),
+    detail: [f.properties && f.properties.type,
+             (f.properties && (f.properties.city || f.properties.state)) || '']
+      .filter(Boolean).join(' · '),
+    lat: f.geometry.coordinates[1],
+    lng: f.geometry.coordinates[0]
+  })).filter(s => s.label);
+}
+
+function attachLocationAutocomplete(input) {
+  if (!input) return;
+  input.setAttribute('autocomplete', 'off');
+  const wrapper = input.closest('.input-wrapper');
+  if (!wrapper) return;
+
+  let dropdown = null, items = [], suggestions = [], activeIndex = -1;
+  let debounceTimer = null, abortController = null;
+
+  function closeDropdown() {
+    if (dropdown) { dropdown.remove(); dropdown = null; }
+    items = []; suggestions = []; activeIndex = -1;
+  }
+
+  function markActive() {
+    items.forEach((el, i) => el.classList.toggle('active', i === activeIndex));
+    if (activeIndex >= 0 && items[activeIndex]) items[activeIndex].scrollIntoView({ block: 'nearest' });
+  }
+
+  function selectSuggestion(s) {
+    input.value = s.label;
+    selectedLocationCoords[input.id] = { lat: s.lat, lng: s.lng, label: s.label };
+    console.log(`📍 Location picked: ${s.label} (${s.lat.toFixed(5)}, ${s.lng.toFixed(5)})`);
+    closeDropdown();
+  }
+
+  function renderDropdown(list) {
+    closeDropdown();
+    if (!list.length) return;
+    dropdown = document.createElement('div');
+    dropdown.className = 'autocomplete-dropdown';
+    list.forEach((s, i) => {
+      const item = document.createElement('div');
+      item.className = 'autocomplete-item';
+      item.innerHTML = `<i class="fa-solid fa-location-dot"></i>
+        <div class="autocomplete-item-text">
+          <div class="autocomplete-item-label">${s.label}</div>
+          ${s.detail ? `<div class="autocomplete-item-detail">${s.detail}</div>` : ''}
+        </div>`;
+      item.addEventListener('mousedown', (e) => { e.preventDefault(); selectSuggestion(s); });
+      dropdown.appendChild(item);
+    });
+    suggestions = list;
+    items = Array.from(dropdown.children);
+    wrapper.appendChild(dropdown);
+  }
+
+  input.addEventListener('input', () => {
+    // Editing the text invalidates a previously picked suggestion
+    const sel = selectedLocationCoords[input.id];
+    if (sel && sel.label !== input.value.trim()) delete selectedLocationCoords[input.id];
+
+    clearTimeout(debounceTimer);
+    const q = input.value.trim();
+    if (q.length < 3) { closeDropdown(); return; }
+
+    debounceTimer = setTimeout(async () => {
+      try {
+        if (abortController) abortController.abort();
+        abortController = new AbortController();
+        const list = await fetchLocationSuggestions(q);
+        renderDropdown(list);
+      } catch (err) {
+        if (err.name !== 'AbortError') console.warn('⚠️ Location suggestions unavailable:', err.message);
+      }
+    }, 350);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (!dropdown) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); activeIndex = Math.min(items.length - 1, activeIndex + 1); markActive(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIndex = Math.max(0, activeIndex - 1); markActive(); }
+    else if (e.key === 'Enter' && activeIndex >= 0 && suggestions[activeIndex]) {
+      e.preventDefault();
+      selectSuggestion(suggestions[activeIndex]);
+    }
+    else if (e.key === 'Escape') { closeDropdown(); }
+  });
+
+  input.addEventListener('blur', () => setTimeout(closeDropdown, 150));
+}
+
 /* --- Distance / duration formatting (OSRM returns raw meters/seconds) --- */
 function formatDistanceMeters(meters) {
   if (meters < 1000) return `${Math.round(meters)} m`;
@@ -102,28 +221,90 @@ function formatDurationSeconds(seconds) {
 }
 
 /* --- Route planning via OSRM (replaces google.maps.DirectionsService) --- */
-async function fetchRoutesFromOSRM(source, destination) {
-  // Nominatim fair-use: sequential requests, spaced ~1.1s apart
-  const origin = await geocodeLocation(source);
-  await new Promise(r => setTimeout(r, 1100));
-  const dest = await geocodeLocation(destination);
+function computeViaPoint(points, fraction, offsetMeters) {
+  // A point near the route at `fraction` along it, offset perpendicular by offsetMeters
+  if (!points || points.length < 3) return null;
+  const idx = Math.min(points.length - 2, Math.max(1, Math.round(fraction * (points.length - 1))));
+  const a = points[idx - 1], b = points[idx + 1];
+  const latRad = ((a[0] + b[0]) / 2) * Math.PI / 180;
+  let dx = (b[1] - a[1]) * Math.cos(latRad);
+  let dy = b[0] - a[0];
+  const len = Math.hypot(dx, dy);
+  if (!len) return null;
+  const px = -dy / len, py = dx / len; // unit perpendicular
+  return {
+    lat: points[idx][0] + py * (offsetMeters / 111320),
+    lng: points[idx][1] + px * (offsetMeters / (111320 * Math.cos(latRad)))
+  };
+}
 
-  if (!origin) throw new Error(`Could not find "${source}" on the map. Try a different spelling or use lat,lng.`);
-  if (!dest) throw new Error(`Could not find "${destination}" on the map. Try a different spelling or use lat,lng.`);
-
-  const coords = `${origin.lng},${origin.lat};${dest.lng},${dest.lat}`;
-  const url = `${OSRM_BASE_URL}/route/v1/driving/${coords}?alternatives=3&overview=full&geometries=polyline`;
-
-  console.log(`🗺️ OSRM route request: ${source} → ${destination}`);
+async function fetchOSRMRoute(origin, dest, via, withAlternatives) {
+  const coords = via
+    ? `${origin.lng},${origin.lat};${via.lng},${via.lat};${dest.lng},${dest.lat}`
+    : `${origin.lng},${origin.lat};${dest.lng},${dest.lat}`;
+  const url = `${OSRM_BASE_URL}/route/v1/driving/${coords}?overview=full&geometries=polyline`
+            + (withAlternatives ? '&alternatives=3' : '');
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Routing service error (HTTP ${response.status})`);
   const data = await response.json();
+  if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) return null;
+  return data.routes;
+}
 
-  if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
-    throw new Error(`No driving route found (${data.code || 'NoRoute'})`);
+function routesTooSimilar(a, b) {
+  return Math.abs(a.distance - b.distance) / b.distance < 0.03 &&
+         Math.abs(a.duration - b.duration) / b.duration < 0.05;
+}
+
+async function fetchRoutesFromOSRM(source, destination) {
+  // Use exact coordinates picked from autocomplete suggestions when available
+  // (skips re-geocoding entirely — faster and more reliable)
+  const originPicked = getSelectedCoords('source', source);
+  const destPicked = getSelectedCoords('destination', destination);
+
+  let origin = originPicked, dest = destPicked;
+  if (!origin) origin = await geocodeLocation(source);
+  if (!origin) throw new Error(`Could not find "${source}" on the map. Try a different spelling or use lat,lng.`);
+
+  if (!dest) {
+    if (!originPicked) await new Promise(r => setTimeout(r, 1100)); // Nominatim fair-use spacing
+    dest = await geocodeLocation(destination);
+  }
+  if (!dest) throw new Error(`Could not find "${destination}" on the map. Try a different spelling or use lat,lng.`);
+
+  console.log(`🗺️ OSRM route request: ${source} → ${destination}`);
+  const firstRoutes = await fetchOSRMRoute(origin, dest, null, true);
+  if (!firstRoutes) throw new Error('No driving route found between these locations. Try different locations.');
+
+  const osrmRoutes = [...firstRoutes];
+
+  // OSRM's demo server often returns only ONE route. Build genuinely different
+  // alternatives by routing through a via-point offset from the main path, so
+  // each route card corresponds to a different road (not the same polyline 3x).
+  if (osrmRoutes.length < 3 && firstRoutes[0].distance > 3000) {
+    const basePoints = decodePolyline(firstRoutes[0].geometry);
+    const variants = [
+      { fraction: 0.40, offsetMeters:  500 },
+      { fraction: 0.60, offsetMeters: -500 }
+    ];
+    for (const v of variants) {
+      if (osrmRoutes.length >= 3) break;
+      try {
+        const via = computeViaPoint(basePoints, v.fraction, v.offsetMeters);
+        if (!via) continue;
+        const variantRoutes = await fetchOSRMRoute(origin, dest, via, false);
+        if (!variantRoutes) continue;
+        const candidate = variantRoutes[0];
+        if (osrmRoutes.some(existing => existing.geometry === candidate.geometry || routesTooSimilar(existing, candidate))) continue; // same road — skip
+        console.log(`🔀 Added alternative route via offset point (${v.fraction * 100}% along the route)`);
+        osrmRoutes.push(candidate);
+      } catch (err) {
+        console.warn('⚠️ Alternative route fetch failed:', err.message);
+      }
+    }
   }
 
-  return data.routes.map((r, i) => ({
+  return osrmRoutes.map((r, i) => ({
     index: i,
     polyline: r.geometry,                 // encoded polyline (precision 5, same as before)
     distance_text: formatDistanceMeters(r.distance),
@@ -141,10 +322,12 @@ function warmUpBackend() {
     .catch(() => console.log('⏳ Backend waking up...'));
 }
 
-// Initialize the Leaflet map when the page loads (no API key needed)
+// Initialize the map and location autocomplete when the page loads
 document.addEventListener('DOMContentLoaded', () => {
   warmUpBackend();
   initMap();
+  attachLocationAutocomplete(document.getElementById('source'));
+  attachLocationAutocomplete(document.getElementById('destination'));
 });
 
 /* --- ✅ NEW: Safety-Based Color System --- */
@@ -313,11 +496,16 @@ function sendToBackendForAnalysis(source, destination) {
     summary: r.summary || ''
   }));
 
-  fetch(`${window.BACKEND_URL}/get-routes`, {
+  const postRoutes = () => fetch(`${window.BACKEND_URL}/get-routes`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ source, destination, frontend_routes: frontendRoutes })
-  })
+  });
+
+  postRoutes()
+    // One automatic retry — the backend may still be booting / waking from sleep
+    .catch(() => new Promise((resolve, reject) =>
+      setTimeout(() => postRoutes().then(resolve, reject), 2500)))
     .then((res) => res.json())
     .then((data) => {
       stopLoadingAnimation();
@@ -345,7 +533,7 @@ function sendToBackendForAnalysis(source, destination) {
     .catch((err) => {
       stopLoadingAnimation();
       console.error(err);
-      alert(`Cannot connect to backend (${window.BACKEND_URL}). Ensure backend server is running.`);
+      alert(`Cannot reach the backend at ${window.BACKEND_URL}.\n\nThis usually means it is still starting up (or waking from sleep on the free hosting tier).\n\n→ Wait a few seconds and click "Analyze Route Safety" again.`);
     });
 }
 

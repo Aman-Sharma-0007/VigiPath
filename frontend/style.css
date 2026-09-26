@@ -319,6 +319,26 @@ body.night-mode .legend-note, body.night-mode .legend-low, body.night-mode .lege
 body.night-mode .leaflet-tile-pane { filter: brightness(0.6) saturate(0.85); }
 body.night-mode #map { background: #0f172a; }
 
+/* --- Location autocomplete dropdown (Photon / OpenStreetMap) --- */
+.autocomplete-dropdown {
+    position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+    background: var(--white); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.18); z-index: 1200;
+    max-height: 264px; overflow-y: auto; animation: fadeIn 0.15s ease;
+}
+.autocomplete-item {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border);
+}
+.autocomplete-item:last-child { border-bottom: none; }
+.autocomplete-item:hover, .autocomplete-item.active { background: var(--bg-light); }
+.autocomplete-item > i { color: var(--accent); margin-top: 3px; font-size: 0.85rem; }
+.autocomplete-item-label { font-size: 0.85rem; font-weight: 600; color: var(--text-main); line-height: 1.3; }
+.autocomplete-item-detail { font-size: 0.72rem; color: var(--text-light); margin-top: 2px; }
+body.night-mode .autocomplete-dropdown { background: #1e293b; border-color: #334155; }
+body.night-mode .autocomplete-item { border-bottom-color: #334155; }
+body.night-mode .autocomplete-item:hover, body.night-mode .autocomplete-item.active { background: #334155; }
+
 /* --- Modals --- */
 .modal-overlay {
     display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
