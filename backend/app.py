@@ -106,6 +106,83 @@ if GROQ_AVAILABLE and GROQ_API_KEY:
 else:
     print("⚠️ Groq AI not configured - missing library or API key")
 
+# --- Groq model selection (auto-resolves at runtime; survives model deprecations) ---
+# Preference order: strongest/most capable first. The list is intersected with
+# whatever the API key actually has access to (Groq rotates/retires model IDs).
+GROQ_MODEL_PREFERENCES = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "moonshotai/kimi-k2-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "gemma2-9b-it",
+]
+ACTIVE_GROQ_MODEL = None        # resolved lazily on first use
+GROQ_AVAILABLE_MODELS = None    # full list the API key can use (None = unknown)
+
+def _resolve_groq_model():
+    """Pick the first preferred model the API key can actually use."""
+    global ACTIVE_GROQ_MODEL, GROQ_AVAILABLE_MODELS
+    if ACTIVE_GROQ_MODEL:
+        return ACTIVE_GROQ_MODEL
+    if not groq_client:
+        return None
+    try:
+        available = [m.id for m in groq_client.models.list().data]
+        GROQ_AVAILABLE_MODELS = available
+        for candidate in GROQ_MODEL_PREFERENCES:
+            if candidate in available:
+                ACTIVE_GROQ_MODEL = candidate
+                print(f"🤖 Groq model selected: {ACTIVE_GROQ_MODEL} (of {len(available)} available)")
+                return ACTIVE_GROQ_MODEL
+        if available:  # none of our preferences exist — use anything offered
+            ACTIVE_GROQ_MODEL = sorted(available)[0]
+            print(f"🤖 Groq model selected (fallback): {ACTIVE_GROQ_MODEL}")
+            return ACTIVE_GROQ_MODEL
+    except Exception as e:
+        print(f"⚠️ Could not list Groq models: {e}")
+    ACTIVE_GROQ_MODEL = GROQ_MODEL_PREFERENCES[0]  # best-effort default
+    return ACTIVE_GROQ_MODEL
+
+def call_groq(user_prompt, system_prompt=None, max_tokens=300, temperature=0.4, json_mode=False):
+    """
+    Call Groq with automatic model fallback. Returns the response text, or None
+    if every candidate model failed (callers must fall back to local logic).
+    """
+    if not groq_client:
+        return None
+
+    model = _resolve_groq_model()
+    if GROQ_AVAILABLE_MODELS:
+        # Prefer models the API key actually has access to (avoids doomed 404s)
+        ordered = [m for m in GROQ_MODEL_PREFERENCES if m in GROQ_AVAILABLE_MODELS]
+        ordered += [m for m in GROQ_AVAILABLE_MODELS if m not in ordered]
+    else:
+        ordered = list(GROQ_MODEL_PREFERENCES)
+    candidates = [model] + [m for m in ordered if m != model]
+
+    messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + \
+               [{"role": "user", "content": user_prompt}]
+
+    for candidate in candidates[:3]:  # try at most 3 models per call
+        try:
+            kwargs = dict(messages=messages, model=candidate,
+                          max_tokens=max_tokens, temperature=temperature)
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = groq_client.chat.completions.create(**kwargs)
+            global ACTIVE_GROQ_MODEL
+            if candidate != ACTIVE_GROQ_MODEL:
+                ACTIVE_GROQ_MODEL = candidate
+                print(f"🤖 Groq model switched to: {candidate}")
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"⚠️ Groq call failed with model '{candidate}': {e}")
+            continue
+    return None
+
 # Crime Database for Route Analysis
 CRIME_DATABASE = {
     'theft': {'severity': 'medium', 'icon': '💼', 'color': '#FF9800', 'description': 'Property theft or pickpocketing incident', 'recommendation': 'Keep valuables secure and be aware of surroundings', 'peak_hours': [18, 22], 'common_areas': ['markets', 'crowded places', 'public transport']},
@@ -494,6 +571,28 @@ def _geocode_with_nominatim(query):
         print(f"⚠️ Nominatim geocoding error for '{query}': {e}")
     return None
 
+def _compute_via_point(points, fraction, offset_m):
+    """
+    A point near the route at `fraction` along it (0.0=start, 1.0=end), offset
+    perpendicular from the path by offset_m metres. Used to build genuinely
+    different alternative routes through a via-point.
+    """
+    if not points or len(points) < 3:
+        return None
+    idx = max(1, min(len(points) - 2, int(round(fraction * (len(points) - 1)))))
+    a, b = points[idx - 1], points[idx + 1]
+    lat_rad = radians((a[0] + b[0]) / 2)
+    dx = (b[1] - a[1]) * cos(lat_rad)
+    dy = b[0] - a[0]
+    length = (dx * dx + dy * dy) ** 0.5
+    if length == 0:
+        return None
+    px, py = -dy / length, dx / length  # unit perpendicular
+    return (
+        points[idx][0] + py * (offset_m / 111320.0),
+        points[idx][1] + px * (offset_m / (111320.0 * cos(lat_rad))),
+    )
+
 def _osrm_plan_routes(source, destination):
     """
     Plan alternative driving routes with OSRM (free, keyless). Geocodes the
@@ -521,8 +620,46 @@ def _osrm_plan_routes(source, destination):
             print(f"⚠️ OSRM response: {data.get('code')}")
             return None
 
+        osrm_routes = list(data["routes"])
+
+        # OSRM often returns a single route — build genuinely different
+        # alternatives by routing through via-points offset from the path
+        # (same logic as the frontend), so route cards show different roads.
+        if len(osrm_routes) < 3 and osrm_routes[0].get("distance", 0) > 3000:
+            base_points = polyline.decode(osrm_routes[0].get("geometry", ""))
+            for fraction, offset_m in ((0.40, 500), (0.60, -500)):
+                if len(osrm_routes) >= 3:
+                    break
+                via = _compute_via_point(base_points, fraction, offset_m)
+                if not via:
+                    continue
+                try:
+                    vurl = (f"{OSRM_BASE_URL}/route/v1/driving/"
+                            f"{origin[1]},{origin[0]};{via[1]},{via[0]};{dest[1]},{dest[0]}")
+                    vresp = requests.get(
+                        vurl,
+                        params={"overview": "full", "geometries": "polyline"},
+                        headers={"User-Agent": HTTP_USER_AGENT},
+                        timeout=15
+                    )
+                    vdata = vresp.json()
+                    if vdata.get("code") != "Ok" or not vdata.get("routes"):
+                        continue
+                    candidate = vdata["routes"][0]
+                    existing_geometries = {r.get("geometry", "") for r in osrm_routes}
+                    too_similar = any(
+                        abs(r["distance"] - candidate["distance"]) / max(1.0, r["distance"]) < 0.03
+                        for r in osrm_routes
+                    )
+                    if too_similar or candidate.get("geometry", "") in existing_geometries:
+                        continue  # same road as an existing route — skip
+                    osrm_routes.append(candidate)
+                    print(f"🔀 Added alternative route via offset point ({int(fraction * 100)}% along)")
+                except Exception as e:
+                    print(f"⚠️ Variant route fetch failed: {e}")
+
         routes = []
-        for i, r in enumerate(data["routes"]):
+        for i, r in enumerate(osrm_routes):
             routes.append({
                 "index": i,
                 "polyline": r.get("geometry", ""),
@@ -759,25 +896,17 @@ Respond ONLY with valid JSON (no markdown, no explanation):
     "emergency_tips": ["Tip 1", "Tip 2", "Tip 3"]
 }}"""
 
-        # Call Groq API
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an emergency response assistant. Always respond with valid JSON only."
-                },
-                {
-                    "role": "user", 
-                    "content": prompt
-                }
-            ],
-            model="llama-3.1-8b-instant",  # Fast and current model
-            temperature=0.1,
+        # Call Groq API (auto-selects an available model)
+        response_text = call_groq(
+            prompt,
+            system_prompt="You are an emergency response assistant. Always respond with valid JSON only.",
             max_tokens=4096,
-            response_format={"type": "json_object"}  # Forces JSON response
+            temperature=0.1,
+            json_mode=True
         )
-        
-        response_text = chat_completion.choices[0].message.content.strip()
+        if response_text is None:
+            print("⚠️ Groq AI call failed, using fallback")
+            return get_fallback_emergency_suggestions(lat, lng)
         print(f"📝 Groq Response Length: {len(response_text)} chars")
         print(f"📝 First 200 chars: {response_text[:200]}")
         
@@ -1454,17 +1583,25 @@ Rules:
 - Do NOT use bullet points or markdown — plain sentences only
 - Tone: calm, helpful, like a knowledgeable friend"""
 
-        response = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are SafeRoute AI, a safety navigation assistant. Give clear, concise route safety explanations in plain text."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.4,
-            max_tokens=200
+        explanation = call_groq(
+            prompt,
+            system_prompt="You are SafeRoute AI, a safety navigation assistant. Give clear, concise route safety explanations in plain text.",
+            max_tokens=200,
+            temperature=0.4
         )
 
-        explanation = response.choices[0].message.content.strip()
+        if explanation is None:
+            # Groq unavailable / all models failed — return the local fallback
+            score = safety_score
+            label = "safe" if score >= 75 else "moderately safe" if score >= 60 else "high-risk"
+            explanation = (
+                f"This route has a safety score of {score}/100, making it {label}. "
+                f"There {'are' if hospital_count else 'are no'} {hospital_count} hospital(s) and {police_count} police station(s) nearby. "
+                f"Street lighting coverage is at {light_score}%. "
+                f"{'Consider travelling during daylight hours for added safety.' if score < 75 else 'This is a recommended route for safe travel.'}"
+            )
+            print(f"ℹ️ AI Explainer used local fallback for Route {route_index + 1}")
+
         print(f"🤖 AI Safety Explainer: Route {route_index + 1} explained ({len(explanation)} chars)")
 
         return jsonify({
@@ -1548,12 +1685,7 @@ def predict_safety():
                     f"Street lighting: {lights}%, Police stations: {police}, Crime index: {crime_score}/100. "
                     f"Write ONE sentence explaining the biggest time-based risk factor for this route. Plain text only."
                 )
-                r = groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile",
-                    temperature=0.3, max_tokens=80
-                )
-                insight = r.choices[0].message.content.strip()
+                insight = call_groq(prompt, max_tokens=80, temperature=0.3)
             except Exception:
                 pass
 
@@ -1632,17 +1764,18 @@ Write a natural, spoken 4-5 sentence safety briefing. Rules:
 - Write exactly as it should be spoken aloud — natural, calm, confident
 - Numbers should be spelled naturally (say "two hospitals" not "2")"""
 
-        response = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are SafeRoute AI, a calm and confident safety navigation assistant. Speak naturally as if talking to a friend."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.5,
-            max_tokens=250
+        narration = call_groq(
+            prompt,
+            system_prompt="You are SafeRoute AI, a calm and confident safety navigation assistant. Speak naturally as if talking to a friend.",
+            max_tokens=250,
+            temperature=0.5
         )
 
-        narration = response.choices[0].message.content.strip()
+        if narration is None:
+            # Groq unavailable — tell the frontend to use its local TTS fallback
+            print(f"ℹ️ Route Narrator using local fallback for Route {route_num}")
+            return jsonify({"narration": None})
+
         print(f"🎙️ Route Narrator: Route {route_num} ({len(narration)} chars)")
 
         return jsonify({"status": "success", "narration": narration, "route_index": route_num - 1})
@@ -1913,16 +2046,16 @@ def ai_status():
             "primary_ai": "OpenStreetMap (Overpass API)"
         }
         
-        # Test Groq if available
+        # Test Groq if available (with automatic model resolution)
         if GROQ_AVAILABLE and groq_client:
+            status_info["groq_model"] = _resolve_groq_model()
             try:
-                test_response = groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": "Test"}],
-                    model="llama-3.3-70b-versatile",
-                    max_tokens=5
-                )
-                status_info["groq_test_success"] = True
-                status_info["groq_test_response"] = test_response.choices[0].message.content
+                test_response = call_groq("Test", max_tokens=5)
+                status_info["groq_test_success"] = bool(test_response)
+                if test_response:
+                    status_info["groq_test_response"] = test_response
+                else:
+                    status_info["groq_test_error"] = "no available model responded"
             except Exception as e:
                 status_info["groq_test_success"] = False
                 status_info["groq_test_error"] = str(e)
